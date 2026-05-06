@@ -100,7 +100,13 @@ function collectItemWindows(
 ): ItemW[] {
   const out: ItemW[] = [];
   for (const b of bookings) {
-    if (b.bookingStatus === 'cancelled') continue;
+    if (
+      b.bookingStatus === 'cancelled' ||
+      b.bookingStatus === 'no_show' ||
+      b.bookingStatus === 'completed'
+    ) {
+      continue;
+    }
     for (const it of b.items || []) {
       if (it.courtId !== courtId) continue;
       if (it.courtKind !== courtKind) continue;

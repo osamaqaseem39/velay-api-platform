@@ -409,44 +409,7 @@ export class BookingsService {
   }
 
   private resolveBookingViewStatus(booking: Booking): BookingViewStatus {
-    if (
-      booking.bookingStatus !== 'confirmed' &&
-      booking.bookingStatus !== 'pending'
-    ) {
-      return booking.bookingStatus;
-    }
-
-    const todayKarachi = getCurrentDateInKarachi();
-    const nowMinutesKarachi = getCurrentMinutesInKarachi();
-    const activeItem = (booking.items ?? []).some((item) => {
-      if (item.itemStatus === 'cancelled') return false;
-      const itemDate = formatDateOnly(item.date ?? booking.bookingDate);
-      const startMinutes = toMinutes(item.startTime, false);
-      let endMinutes = toMinutes(item.endTime, true);
-      if (!Number.isFinite(startMinutes) || !Number.isFinite(endMinutes)) {
-        return false;
-      }
-
-      // Overnight slot (e.g., 23:00 -> 00:00 or 01:00) spans to next day.
-      if (endMinutes <= startMinutes) {
-        endMinutes += 24 * 60;
-        const nextDay = addDays(itemDate, 1);
-        if (todayKarachi === itemDate) {
-          return nowMinutesKarachi >= startMinutes;
-        }
-        if (todayKarachi === nextDay) {
-          return nowMinutesKarachi < endMinutes - 24 * 60;
-        }
-        return false;
-      }
-
-      return (
-        todayKarachi === itemDate &&
-        startMinutes <= nowMinutesKarachi &&
-        nowMinutesKarachi < endMinutes
-      );
-    });
-    return activeItem ? 'live' : booking.bookingStatus;
+    return booking.bookingStatus;
   }
 
   async list(requesterUserId: string, tenantId?: string, locationId?: string): Promise<BookingApiRow[]> {
@@ -2049,8 +2012,7 @@ export class BookingsService {
           bookingStatus: In([
             'pending',
             'confirmed',
-            'completed',
-            'no_show',
+            'live',
           ] as BookingStatus[]),
         },
         relations: ['items', 'user'],

@@ -84,9 +84,7 @@ export class UpdateBookingDto {
     typeof value === 'string'
       ? value.toLowerCase() === 'cancel'
         ? 'cancelled'
-        : value.toLowerCase() === 'live'
-          ? 'confirmed'
-          : value
+        : value
       : value,
   )
   @IsOptional()

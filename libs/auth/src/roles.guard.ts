@@ -2,6 +2,8 @@ import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { ROLES_KEY } from './roles.decorator';
 
+const PLATFORM_ALLOWED_ROLES = ['platform-owner'] as const;
+
 @Injectable()
 export class RolesGuard implements CanActivate {
   constructor(private readonly reflector: Reflector) {}
@@ -18,6 +20,12 @@ export class RolesGuard implements CanActivate {
 
     const { user } = context.switchToHttp().getRequest<{ user?: { roles?: string[] } }>();
     const roles = user?.roles ?? [];
-    return requiredRoles.some((role) => roles.includes(role));
+    const effectiveRequired = requiredRoles.filter((role) =>
+      PLATFORM_ALLOWED_ROLES.includes(role as (typeof PLATFORM_ALLOWED_ROLES)[number]),
+    );
+    if (!effectiveRequired.length) {
+      return false;
+    }
+    return effectiveRequired.some((role) => roles.includes(role));
   }
 }

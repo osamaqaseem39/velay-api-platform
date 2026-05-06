@@ -7,6 +7,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Business } from '../businesses/entities/business.entity';
 import { BusinessLocation } from '../businesses/entities/business-location.entity';
+import { BillingService } from '../billing/billing.service';
 import { IamService } from '../iam/iam.service';
 import { normalizePlanId, PLAN_ENTITLEMENTS } from './plan-catalog';
 import type {
@@ -22,6 +23,7 @@ export class EntitlementsService {
     private readonly businessesRepository: Repository<Business>,
     @InjectRepository(BusinessLocation)
     private readonly locationsRepository: Repository<BusinessLocation>,
+    private readonly billingService: BillingService,
     private readonly iamService: IamService,
   ) {}
 
@@ -47,6 +49,12 @@ export class EntitlementsService {
     const base = PLAN_ENTITLEMENTS[planId];
 
     const features = { ...base.features };
+    const pricingPlan = this.billingService.getLatestPricingPlanForTenant(tenantId);
+    if (pricingPlan) {
+      (Object.keys(features) as SaasFeature[]).forEach((key) => {
+        features[key] = pricingPlan.features.includes(key);
+      });
+    }
     if (!isPayingActive) {
       (Object.keys(features) as SaasFeature[]).forEach((k) => {
         features[k] = false;
@@ -57,11 +65,12 @@ export class EntitlementsService {
       tenantId,
       planId,
       subscriptionStatus,
-      billingCycle: sub.billingCycle?.trim() ?? null,
+      billingCycle: pricingPlan?.billingPeriod ?? sub.billingCycle?.trim() ?? null,
       isPayingActive,
       features,
       limits: {
-        maxBusinessLocations: base.maxBusinessLocations,
+        maxBusinessLocations:
+          pricingPlan?.maxBusinessLocations ?? base.maxBusinessLocations,
       },
     };
   }

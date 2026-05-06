@@ -14,6 +14,8 @@ import { SystemRole } from '../iam.constants';
 import { IamService } from '../iam.service';
 import { ROLES_KEY } from './roles.decorator';
 
+const PLATFORM_ALLOWED_ROLES: ReadonlyArray<SystemRole> = ['platform-owner'];
+
 @Injectable()
 export class RolesGuard implements CanActivate {
   constructor(
@@ -93,11 +95,9 @@ export class RolesGuard implements CanActivate {
     }
 
     const userId = ext.userId?.trim();
-    const requestMethod = request.method?.toUpperCase();
-    const rolesToCheck: SystemRole[] =
-      requestMethod === 'GET' && !requiredRoles.includes('customer-end-user')
-        ? [...requiredRoles, 'customer-end-user']
-        : requiredRoles;
+    const rolesToCheck = requiredRoles.filter((role) =>
+      PLATFORM_ALLOWED_ROLES.includes(role),
+    );
 
     if (!userId) {
       throw new UnauthorizedException('Missing authentication');
@@ -109,12 +109,18 @@ export class RolesGuard implements CanActivate {
       );
     }
 
+    if (rolesToCheck.length === 0) {
+      throw new ForbiddenException(
+        'This API is restricted to platform-owner role only',
+      );
+    }
+
     await this.iamService.assertRequesterActive(userId);
 
     const allowed = await this.iamService.hasAnyRole(userId, rolesToCheck);
     if (!allowed) {
       throw new ForbiddenException(
-        `User ${userId} does not have required role for this endpoint`,
+        `User ${userId} does not have the required role to access this endpoint`,
       );
     }
 

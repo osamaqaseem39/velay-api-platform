@@ -8,5 +8,6 @@ import { IamModule } from '../iam/iam.module';
   imports: [IamModule],
   controllers: [BillingController],
   providers: [BillingService],
+  exports: [BillingService],
 })
 export class BillingModule {}
