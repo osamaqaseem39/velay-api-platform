@@ -447,8 +447,8 @@ export class BookingsController {
       }
       const result = await this.bookingsService.create(tenantId, dto);
 
-      // Explicit check in controller as requested: block slots if confirmed
-      if (result.bookingStatus === 'confirmed') {
+      // Explicit check in controller as requested: block slots if booking is active
+      if (result.bookingStatus === 'confirmed' || result.bookingStatus === 'live') {
         await this.bookingsService.syncFacilitySlotsStatusById(
           tenantId,
           result.bookingId,

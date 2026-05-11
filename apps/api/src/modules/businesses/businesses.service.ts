@@ -609,11 +609,9 @@ export class BusinessesService {
                 isActive: true,
                 courtStatus: 'active',
               },
-              select: ['id', 'name', 'businessLocationId', 'pricePerSlot'],
             }),
             await this.turfCourtRepository.find({
               where: { branchId: In(locationIds), status: 'active' },
-              select: ['id', 'name', 'branchId', 'pricing', 'supportedSports'],
             }),
             await this.tableTennisCourtRepository.find({
               where: {
@@ -621,7 +619,6 @@ export class BusinessesService {
                 isActive: true,
                 courtStatus: 'active',
               },
-              select: ['id', 'name', 'businessLocationId', 'pricePerSlot'],
             }),
             await this.gamingStationRepository.find({
               where: {
@@ -629,22 +626,36 @@ export class BusinessesService {
                 isActive: true,
                 unitStatus: 'active',
               },
-              select: ['id', 'name', 'businessLocationId', 'pricePerSlot'],
             }),
           ]
         : [[], [], [], []];
 
-      const facilityCourtsByLocation = new Map<
-        string,
-        Array<{
-          facilityType: 'padel' | 'turf' | 'table-tennis' | 'gaming';
-          id: string;
-          name: string;
-          price?: number;
-          pricing?: TurfPricingConfig;
-          supportedSports?: string[];
-        }>
-      >();
+      // Decimal columns come back from pg as strings; normalize to nullable numbers
+      // so consumers don't need to parse them (and so we keep dimensions consistent).
+      const toNumberOrNull = (v: unknown): number | null => {
+        if (v == null) return null;
+        const n = typeof v === 'number' ? v : parseFloat(String(v));
+        return Number.isFinite(n) ? n : null;
+      };
+
+      type FacilityCourtRow = {
+        facilityType: 'padel' | 'turf' | 'table-tennis' | 'gaming';
+        id: string;
+        name: string;
+        price?: number;
+        pricing?: TurfPricingConfig;
+        supportedSports?: string[];
+        dimensions?: {
+          length: number | null;
+          width: number | null;
+          ceilingHeight: number | null;
+          ceilingHeightUnit: string | null;
+          unit: 'm';
+        };
+        details?: Record<string, unknown>;
+      };
+
+      const facilityCourtsByLocation = new Map<string, FacilityCourtRow[]>();
 
       for (const c of padelCourts) {
         const key = c.businessLocationId ?? '';
@@ -654,6 +665,33 @@ export class BusinessesService {
           id: c.id,
           name: c.name,
           price: parseFloat(c.pricePerSlot ?? '0'),
+          dimensions: {
+            length: toNumberOrNull(c.lengthM),
+            width: toNumberOrNull(c.widthM),
+            ceilingHeight: toNumberOrNull(c.ceilingHeightValue),
+            ceilingHeightUnit: c.ceilingHeightUnit ?? null,
+            unit: 'm',
+          },
+          details: {
+            arenaLabel: c.arenaLabel ?? null,
+            description: c.description ?? null,
+            imageUrls: c.imageUrls ?? [],
+            coveredType: c.coveredType ?? null,
+            glassWalls: c.glassWalls ?? null,
+            wallType: c.wallType ?? null,
+            surfaceType: c.surfaceType ?? null,
+            matchType: c.matchType ?? null,
+            maxPlayers: c.maxPlayers ?? null,
+            lighting: c.lighting ?? null,
+            ventilation: c.ventilation ?? null,
+            slotDurationMinutes: c.slotDurationMinutes ?? null,
+            bufferBetweenSlotsMinutes: c.bufferBetweenSlotsMinutes ?? null,
+            membershipPrice: toNumberOrNull(c.membershipPrice),
+            peakPricing: c.peakPricing ?? null,
+            amenities: c.amenities ?? null,
+            extras: c.extras ?? null,
+            rules: c.rules ?? null,
+          },
         });
         facilityCourtsByLocation.set(key, rows);
       }
@@ -668,6 +706,21 @@ export class BusinessesService {
             c.pricing?.futsal?.basePrice ?? c.pricing?.cricket?.basePrice ?? 0,
           pricing: c.pricing,
           supportedSports: c.supportedSports,
+          dimensions: {
+            length: toNumberOrNull(c.length),
+            width: toNumberOrNull(c.width),
+            ceilingHeight: toNumberOrNull(c.ceilingHeight),
+            ceilingHeightUnit: 'm',
+            unit: 'm',
+          },
+          details: {
+            coveredType: c.coveredType ?? null,
+            surfaceType: c.surfaceType ?? null,
+            turfQuality: c.turfQuality ?? null,
+            sportConfig: c.sportConfig ?? null,
+            slotDurationMinutes: c.slotDuration ?? null,
+            bufferBetweenSlotsMinutes: c.bufferTime ?? null,
+          },
         });
         facilityCourtsByLocation.set(key, rows);
       }
@@ -679,6 +732,20 @@ export class BusinessesService {
           id: c.id,
           name: c.name,
           price: parseFloat(c.pricePerSlot ?? '0'),
+          dimensions: {
+            length: null,
+            width: null,
+            ceilingHeight: null,
+            ceilingHeightUnit: null,
+            unit: 'm',
+          },
+          details: {
+            description: c.description ?? null,
+            imageUrls: c.imageUrls ?? [],
+            slotDurationMinutes: c.slotDurationMinutes ?? null,
+            bufferBetweenSlotsMinutes: c.bufferBetweenSlotsMinutes ?? null,
+            meta: c.meta ?? null,
+          },
         });
         facilityCourtsByLocation.set(key, rows);
       }
@@ -690,6 +757,24 @@ export class BusinessesService {
           id: c.id,
           name: c.name,
           price: parseFloat(c.pricePerSlot ?? '0'),
+          dimensions: {
+            length: null,
+            width: null,
+            ceilingHeight: null,
+            ceilingHeightUnit: null,
+            unit: 'm',
+          },
+          details: {
+            setupCode: c.setupCode ?? null,
+            description: c.description ?? null,
+            imageUrls: c.imageUrls ?? [],
+            bundleNote: c.bundleNote ?? null,
+            slotDurationMinutes: c.slotDurationMinutes ?? null,
+            bufferBetweenSlotsMinutes: c.bufferBetweenSlotsMinutes ?? null,
+            peakPricing: c.peakPricing ?? null,
+            amenities: c.amenities ?? null,
+            specs: c.specs ?? null,
+          },
         });
         facilityCourtsByLocation.set(key, rows);
       }
@@ -1212,6 +1297,8 @@ export class BusinessesService {
         locationId: row.id,
         pricePerSlot: f.price ?? 0,
         supportedSports: f.supportedSports,
+        dimensions: f.dimensions ?? null,
+        details: f.details ?? null,
       })),
       tenantId: row.business?.tenantId ?? null,
     };

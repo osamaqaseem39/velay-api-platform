@@ -9,7 +9,14 @@ import {
 } from '@nestjs/common';
 import { IamService } from '../iam/iam.service';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Between, Brackets, DeepPartial, In, Repository } from 'typeorm';
+import {
+  Between,
+  Brackets,
+  DeepPartial,
+  In,
+  QueryFailedError,
+  Repository,
+} from 'typeorm';
 import { PadelCourt } from '../arena/padel-court/entities/padel-court.entity';
 import { TableTennisCourt } from '../arena/table-tennis-court/entities/table-tennis-court.entity';
 import { TurfCourt } from '../arena/turf/entities/turf-court.entity';
@@ -64,10 +71,15 @@ function harmonizePaymentStatusWithAmounts(b: {
   paidAmount: string;
   paymentStatus: PaymentStatus;
 }): void {
-  if (numFromDec(b.paidAmount) === numFromDec(b.totalAmount)) {
-    if (b.paymentStatus !== 'refunded' && b.paymentStatus !== 'failed') {
-      b.paymentStatus = 'paid';
-    }
+  if (b.paymentStatus === 'refunded' || b.paymentStatus === 'failed') return;
+  const total = numFromDec(b.totalAmount);
+  const paid = numFromDec(b.paidAmount);
+  if (paid <= 0) {
+    b.paymentStatus = 'pending';
+  } else if (paid < total) {
+    b.paymentStatus = 'partially_paid';
+  } else if (paid === total) {
+    b.paymentStatus = 'paid';
   }
 }
 
@@ -204,6 +216,26 @@ export class BookingsService {
   private readonly logger = new Logger(BookingsService.name);
   private static readonly MAX_BOOKING_DAYS_AHEAD = 14;
   private static readonly DEFAULT_SLOT_STEP_MINUTES = 60;
+  private static readonly SLOT_OVERLAP_GRACE_MINUTES = 15;
+
+  private computePayableAmount(
+    subTotal: number,
+    discount: number,
+    tax: number,
+  ): number {
+    return Math.max(0, Number((subTotal - discount + tax).toFixed(2)));
+  }
+
+  private assertPaidAmountWithinPayable(
+    paidAmount: number,
+    payableAmount: number,
+  ): void {
+    if (paidAmount > payableAmount) {
+      throw new BadRequestException(
+        'paidAmount cannot be greater than payable amount',
+      );
+    }
+  }
 
   private assertBookingDateInAllowedWindow(bookingDate: string): void {
     const requested = formatDateOnly(bookingDate);
@@ -281,9 +313,11 @@ export class BookingsService {
   private async resolveLocationMappingBatch(bookings: Booking[]): Promise<{
     locationsMap: Record<string, string>;
     courtToLocationMap: Record<string, string>;
+    locationTimeZoneMap: Record<string, string>;
   }> {
     const locationsMap: Record<string, string> = {};
     const courtToLocationMap: Record<string, string> = {};
+    const locationTimeZoneMap: Record<string, string> = {};
 
     const padelIds = new Set<string>();
     const turfIds = new Set<string>();
@@ -333,29 +367,49 @@ export class BookingsService {
     if (locationIds.size > 0) {
       const locations = await this.locationRepo.find({
         where: { id: In([...locationIds]) },
-        select: ['id', 'name'],
+        select: ['id', 'name', 'timezone'],
       });
       for (const loc of locations) {
         locationsMap[loc.id] = loc.name;
+        const tz = loc.timezone?.trim();
+        if (tz) locationTimeZoneMap[loc.id] = tz;
       }
     }
 
-    return { locationsMap, courtToLocationMap };
+    return { locationsMap, courtToLocationMap, locationTimeZoneMap };
   }
 
   private async resolveLocationMapping(booking: Booking): Promise<{
     locationsMap: Record<string, string>;
     courtToLocationMap: Record<string, string>;
+    locationTimeZoneMap: Record<string, string>;
   }> {
     return this.resolveLocationMappingBatch([booking]);
   }
- 
+
+  /** Start instant for overlap / ordering; prefers persisted `startDatetime`. */
+  private itemPlayStartMs(item: BookingItem, bookingBookingDate: string): number {
+    if (item.startDatetime) return item.startDatetime.getTime();
+    const d = formatDateOnly(item.date ?? bookingBookingDate);
+    return this.toSlotDateTimes(d, item.startTime, item.endTime).startDatetime.getTime();
+  }
+
+  private sortBookingItemsForTimeline(booking: Booking): BookingItem[] {
+    const arr = [...(booking.items ?? [])];
+    const bd = formatDateOnly(booking.bookingDate);
+    arr.sort((a, b) => this.itemPlayStartMs(a, bd) - this.itemPlayStartMs(b, bd));
+    return arr;
+  }
+
   private toApi(
     booking: Booking,
     locationsMap: Record<string, string> = {},
     courtToLocationMap: Record<string, string> = {},
+    locationTimeZoneMap: Record<string, string> = {},
+    opts?: { projectLiveViewStatus?: boolean },
   ): BookingApiRow {
-    const first = booking.items?.[0];
+    const timelineItems = this.sortBookingItemsForTimeline(booking);
+    const first = timelineItems[0];
     const courtId = first?.courtId;
     const locationId = courtId ? courtToLocationMap[courtId] : undefined;
     const arenaId = locationId || booking.tenantId;
@@ -374,7 +428,7 @@ export class BookingsService {
         : undefined,
       sportType: booking.sportType,
       bookingDate: formatDateOnly(booking.bookingDate),
-      items: (booking.items ?? []).map((it) => ({
+      items: timelineItems.map((it) => ({
         id: it.id,
         date: it.date,
         courtKind: it.courtKind,
@@ -400,7 +454,13 @@ export class BookingsService {
         paidAmount: numFromDec(booking.paidAmount),
         remainingAmount: numFromDec(booking.totalAmount) - numFromDec(booking.paidAmount),
       },
-      bookingStatus: this.resolveBookingViewStatus(booking),
+      bookingStatus:
+        opts?.projectLiveViewStatus === false
+          ? booking.bookingStatus
+          : this.resolveBookingViewStatus(
+              booking,
+              locationId ? locationTimeZoneMap[locationId] : undefined,
+            ),
       notes: booking.notes,
       cancellationReason: booking.cancellationReason,
       createdAt: booking.createdAt.toISOString(),
@@ -408,7 +468,11 @@ export class BookingsService {
     };
   }
 
-  private resolveBookingViewStatus(booking: Booking): BookingViewStatus {
+  private resolveBookingViewStatus(
+    booking: Booking,
+    locationTimeZone?: string,
+  ): BookingViewStatus {
+    void locationTimeZone;
     return booking.bookingStatus;
   }
 
@@ -453,34 +517,12 @@ export class BookingsService {
     qb.orderBy('b.createdAt', 'DESC');
     const rows = await qb.getMany();
 
-    // Fetch location mapping for toApi
-    const locationsMap: Record<string, string> = {};
-    const courtToLocationMap: Record<string, string> = {};
+    const { locationsMap, courtToLocationMap, locationTimeZoneMap } =
+      await this.resolveLocationMappingBatch(rows);
 
-    if (tenantId) {
-      const business = await this.businessRepo.findOne({ where: { tenantId } });
-      if (business) {
-        const locations = await this.locationRepo.find({ where: { businessId: business.id } });
-        for (const loc of locations) locationsMap[loc.id] = loc.name;
-      }
-      
-      const padels = await this.padelRepo.find({ where: { tenantId }, select: ['id', 'businessLocationId'] });
-      for (const p of padels) if (p.businessLocationId) courtToLocationMap[p.id] = p.businessLocationId;
-      
-      const turfs = await this.turfRepo.find({ where: { tenantId }, select: ['id', 'branchId'] });
-      for (const t of turfs) if (t.branchId) courtToLocationMap[t.id] = t.branchId;
-    } else {
-      const locations = await this.locationRepo.find({ select: ['id', 'name'] });
-      for (const loc of locations) locationsMap[loc.id] = loc.name;
-      
-      const padels = await this.padelRepo.find({ select: ['id', 'businessLocationId'] });
-      for (const p of padels) if (p.businessLocationId) courtToLocationMap[p.id] = p.businessLocationId;
-      
-      const turfs = await this.turfRepo.find({ select: ['id', 'branchId'] });
-      for (const t of turfs) if (t.branchId) courtToLocationMap[t.id] = t.branchId;
-    }
-
-    return rows.map((b) => this.toApi(b, locationsMap, courtToLocationMap));
+    return rows.map((b) =>
+      this.toApi(b, locationsMap, courtToLocationMap, locationTimeZoneMap),
+    );
   }
 
   async listByUserForProfile(userId: string): Promise<BookingApiRow[]> {
@@ -490,10 +532,12 @@ export class BookingsService {
       order: { createdAt: 'DESC' },
     });
 
-    const { locationsMap, courtToLocationMap } =
+    const { locationsMap, courtToLocationMap, locationTimeZoneMap } =
       await this.resolveLocationMappingBatch(rows);
 
-    return rows.map((b) => this.toApi(b, locationsMap, courtToLocationMap));
+    return rows.map((b) =>
+      this.toApi(b, locationsMap, courtToLocationMap, locationTimeZoneMap),
+    );
   }
 
   async getOne(tenantId: string, bookingId: string, requesterUserId?: string): Promise<BookingApiRow> {
@@ -514,10 +558,10 @@ export class BookingsService {
       }
     }
 
-    const { locationsMap, courtToLocationMap } =
+    const { locationsMap, courtToLocationMap, locationTimeZoneMap } =
       await this.resolveLocationMapping(row);
 
-    return this.toApi(row, locationsMap, courtToLocationMap);
+    return this.toApi(row, locationsMap, courtToLocationMap, locationTimeZoneMap);
   }
 
   private async assertPadelCourtExists(
@@ -635,30 +679,139 @@ export class BookingsService {
     };
   }
 
+  private isOverlapBeyondGrace(
+    existingStart: Date,
+    existingEnd: Date,
+    requestedStart: Date,
+    requestedEnd: Date,
+  ): boolean {
+    const overlapStartMs = Math.max(
+      existingStart.getTime(),
+      requestedStart.getTime(),
+    );
+    const overlapEndMs = Math.min(existingEnd.getTime(), requestedEnd.getTime());
+    if (overlapEndMs <= overlapStartMs) return false;
+
+    const overlapMinutes = (overlapEndMs - overlapStartMs) / 60000;
+    if (overlapMinutes > BookingsService.SLOT_OVERLAP_GRACE_MINUTES) {
+      return true;
+    }
+
+    const touchesRequestedStart =
+      existingStart.getTime() < requestedStart.getTime() &&
+      existingEnd.getTime() > requestedStart.getTime();
+    const touchesRequestedEnd =
+      existingStart.getTime() < requestedEnd.getTime() &&
+      existingEnd.getTime() > requestedEnd.getTime();
+    return !(touchesRequestedStart || touchesRequestedEnd);
+  }
+
+  /** Same-night chronological order before expanding/splitting (aligns with web app overnight sorting). */
+  private sortInboundBookingItemsForCreate(
+    bookingDate: string | undefined,
+    items: CreateBookingItemDto[],
+  ): CreateBookingItemDto[] {
+    if (!items.length) return [...items];
+
+    const baseFallback = bookingDate ? formatDateOnly(bookingDate) : '';
+    type Row = {
+      item: CreateBookingItemDto;
+      dateKey: string;
+      rawStart: number;
+      sortKey: number;
+      idx: number;
+    };
+
+    const rows: Row[] = items.map((item, idx) => {
+      const dk =
+        formatDateOnly(item.date ?? item.bookingDate ?? baseFallback ?? '') ||
+        '__nodate__';
+      const rawStart = toMinutes(item.startTime, false);
+      return {
+        item,
+        dateKey: dk,
+        rawStart,
+        sortKey: rawStart,
+        idx,
+      };
+    });
+
+    const byDate = new Map<string, Row[]>();
+    for (const row of rows) {
+      const bucket = byDate.get(row.dateKey);
+      if (bucket) bucket.push(row);
+      else byDate.set(row.dateKey, [row]);
+    }
+
+    for (const group of byDate.values()) {
+      if (group.length < 2) continue;
+      const mins = group.map((g) => g.rawStart);
+      const minS = Math.min(...mins);
+      const maxS = Math.max(...mins);
+      if (maxS - minS <= 12 * 60) continue;
+      for (const g of group) {
+        if (g.rawStart < 6 * 60) g.sortKey = g.rawStart + 24 * 60;
+      }
+    }
+
+    rows.sort((a, b) => {
+      if (a.dateKey !== b.dateKey) return a.dateKey.localeCompare(b.dateKey);
+      if (a.sortKey !== b.sortKey) return a.sortKey - b.sortKey;
+      const endDiff = toMinutes(a.item.endTime, true) - toMinutes(b.item.endTime, true);
+      if (endDiff !== 0) return endDiff;
+      if (a.item.courtKind !== b.item.courtKind) {
+        return a.item.courtKind.localeCompare(b.item.courtKind);
+      }
+      return a.item.courtId.localeCompare(b.item.courtId) || a.idx - b.idx;
+    });
+
+    return rows.map((r) => r.item);
+  }
+
   private resolveItemBookingDates(
     bookingDate: string,
     items: CreateBookingItemDto[],
   ): string[] {
     const baseDate = formatDateOnly(bookingDate);
     const dayOffsetByCourt = new Map<string, number>();
-    const prevStartByCourt = new Map<string, number>();
+    const prevEffectiveByCourt = new Map<string, number>();
+
+    const startsByCourt = new Map<string, number[]>();
+    for (const item of items) {
+      const key = `${item.courtKind}:${item.courtId}`;
+      const raw = toMinutes(item.startTime, false);
+      const list = startsByCourt.get(key);
+      if (list) list.push(raw);
+      else startsByCourt.set(key, [raw]);
+    }
+
+    const toEffectiveStart = (courtKey: string, rawStart: number): number => {
+      const list = startsByCourt.get(courtKey) ?? [rawStart];
+      if (list.length < 2) return rawStart;
+      const minS = Math.min(...list);
+      const maxS = Math.max(...list);
+      if (maxS - minS > 12 * 60 && rawStart < 6 * 60) {
+        return rawStart + 24 * 60;
+      }
+      return rawStart;
+    };
 
     return items.map((item) => {
       const key = `${item.courtKind}:${item.courtId}`;
-      const currentStart = toMinutes(item.startTime, false);
-      const previousStart = prevStartByCourt.get(key);
+      const raw = toMinutes(item.startTime, false);
+      const effective = toEffectiveStart(key, raw);
+      const prevEffective = prevEffectiveByCourt.get(key);
       let offset = dayOffsetByCourt.get(key) ?? 0;
 
-      // If times wrap backwards for the same court in a single payload,
-      // treat subsequent rows as next-day selections.
-      if (previousStart !== undefined && currentStart < previousStart) {
+      // Effective timeline went backwards ⇒ next calendar day for this court.
+      if (prevEffective !== undefined && effective < prevEffective) {
         offset += 1;
         dayOffsetByCourt.set(key, offset);
       } else if (!dayOffsetByCourt.has(key)) {
         dayOffsetByCourt.set(key, offset);
       }
 
-      prevStartByCourt.set(key, currentStart);
+      prevEffectiveByCourt.set(key, effective);
       return addDays(baseDate, offset);
     });
   }
@@ -714,6 +867,37 @@ export class BookingsService {
     return expanded;
   }
 
+  private applyImmediateStartShift(
+    items: Array<CreateBookingItemDto & { date: string }>,
+  ): Array<CreateBookingItemDto & { date: string }> {
+    const today = getCurrentDateInKarachi();
+    const nowMinutes = getCurrentMinutesInKarachi();
+
+    return items.map((item) => {
+      if (formatDateOnly(item.date) !== today) return item;
+
+      const startMinutes = toMinutes(item.startTime, false);
+      const endMinutes = toMinutes(item.endTime, true);
+      if (nowMinutes <= startMinutes || nowMinutes >= endMinutes) {
+        return item;
+      }
+
+      const durationMinutes = diffMinutes(item.startTime, item.endTime);
+      const shiftedStart = new Date(`${item.date}T00:00:00Z`);
+      shiftedStart.setUTCMinutes(nowMinutes);
+      const shiftedEnd = new Date(
+        shiftedStart.getTime() + durationMinutes * 60 * 1000,
+      );
+
+      return {
+        ...item,
+        date: formatDateOnly(shiftedStart),
+        startTime: shiftedStart.toISOString().slice(11, 16),
+        endTime: shiftedEnd.toISOString().slice(11, 16),
+      };
+    });
+  }
+
   private assertBookingItem(item: CreateBookingItemDto): void {
     if (
       item.courtKind !== 'padel_court' &&
@@ -749,17 +933,27 @@ export class BookingsService {
       .where('i.courtKind = :kind', { kind: item.courtKind })
       .andWhere('i.courtId = :courtId', { courtId: item.courtId })
       .andWhere("i.itemStatus <> 'cancelled'")
-      // Ignore cancelled / no_show bookings (also covers legacy rows where itemStatus was not persisted)
-      .andWhere("b.bookingStatus NOT IN ('cancelled', 'no_show')")
+      // Ignore terminal bookings that should not block new reservations.
+      .andWhere("b.bookingStatus NOT IN ('cancelled', 'no_show', 'completed')")
       .andWhere('i.startDatetime < :endDatetime', {
         endDatetime: endDatetime.toISOString(),
       })
       .andWhere('i.endDatetime > :startDatetime', {
         startDatetime: startDatetime.toISOString(),
       })
-      .getCount();
+      .select(['i.startDatetime AS startDatetime', 'i.endDatetime AS endDatetime'])
+      .getRawMany<{ startDatetime: string; endDatetime: string }>();
 
-    if (overlaps > 0)
+    const hasHardOverlap = overlaps.some((row) =>
+      this.isOverlapBeyondGrace(
+        new Date(row.startDatetime),
+        new Date(row.endDatetime),
+        startDatetime,
+        endDatetime,
+      ),
+    );
+
+    if (hasHardOverlap)
       throw new ConflictException({
         bookingDate: date,
         startTime: item.startTime,
@@ -767,6 +961,52 @@ export class BookingsService {
         courtId: item.courtId,
         reason: 'Selected slot is already booked',
       });
+  }
+
+  private async assertNoOtherLiveBookingOnFields(
+    tenantId: string,
+    items: Array<{
+      courtKind: CreateBookingItemDto['courtKind'];
+      courtId: string;
+      itemStatus?: BookingItemStatus;
+    }>,
+    excludeBookingId?: string,
+  ): Promise<void> {
+    const nowIso = new Date().toISOString();
+    const uniqueFields = new Map<string, { courtKind: string; courtId: string }>();
+    for (const item of items) {
+      if (item.itemStatus === 'cancelled') continue;
+      const key = `${item.courtKind}:${item.courtId}`;
+      if (!uniqueFields.has(key)) {
+        uniqueFields.set(key, {
+          courtKind: item.courtKind,
+          courtId: item.courtId,
+        });
+      }
+    }
+
+    for (const field of uniqueFields.values()) {
+      const qb = this.bookingRepo
+        .createQueryBuilder('b')
+        .innerJoin('b.items', 'i')
+        .where('b.tenantId = :tenantId', { tenantId })
+        .andWhere("b.bookingStatus = 'live'")
+        .andWhere("i.itemStatus <> 'cancelled'")
+        // Guard against stale "live" rows: only block if currently live in time.
+        .andWhere('i.startDatetime <= :nowIso', { nowIso })
+        .andWhere('i.endDatetime > :nowIso', { nowIso })
+        .andWhere('i.courtKind = :courtKind', { courtKind: field.courtKind })
+        .andWhere('i.courtId = :courtId', { courtId: field.courtId });
+      if (excludeBookingId) {
+        qb.andWhere('b.id <> :excludeBookingId', { excludeBookingId });
+      }
+      const liveCount = await qb.getCount();
+      if (liveCount > 0) {
+        throw new ConflictException(
+          'Field is already live. End the current live booking before starting another one.',
+        );
+      }
+    }
   }
 
   async create(
@@ -780,10 +1020,15 @@ export class BookingsService {
     const user = await this.userRepo.findOne({ where: { id: dto.userId } });
     if (!user) throw new BadRequestException(`User ${dto.userId} not found`);
 
-    const expandedItems = this.expandBookingItems(
+    if (dto.items?.length) {
+      dto.items = this.sortInboundBookingItemsForCreate(dto.bookingDate, dto.items);
+    }
+
+    let expandedItems = this.expandBookingItems(
       dto.bookingDate,
       dto.items,
     );
+    expandedItems = this.applyImmediateStartShift(expandedItems);
     for (const item of expandedItems) {
       this.assertBookingDateInAllowedWindow(item.date);
     }
@@ -832,21 +1077,37 @@ export class BookingsService {
       currency: i.currency ?? 'PKR',
       itemStatus: i.status ?? 'confirmed',
     }));
+    itemsPayload.sort(
+      (a, b) =>
+        ((a.startDatetime as Date)?.getTime() ?? 0) -
+        ((b.startDatetime as Date)?.getTime() ?? 0),
+    );
+
+    const pricingSubTotal = Number(dto.pricing.subTotal ?? 0);
+    const pricingDiscount = Number(dto.pricing.discount ?? 0);
+    const pricingTax = Number(dto.pricing.tax ?? 0);
+    const payableAmount = this.computePayableAmount(
+      pricingSubTotal,
+      pricingDiscount,
+      pricingTax,
+    );
+    const paidAmount = Number(dto.payment.paidAmount ?? 0);
+    this.assertPaidAmountWithinPayable(paidAmount, payableAmount);
 
     const bookingPayload: DeepPartial<Booking> = {
       tenantId,
       userId: dto.userId,
       sportType: dto.sportType,
       bookingDate: formatDateOnly(dto.bookingDate ?? expandedItems[0].date),
-      subTotal: dec(dto.pricing.subTotal),
-      discount: dec(dto.pricing.discount),
-      tax: dec(dto.pricing.tax),
-      totalAmount: dec(dto.pricing.totalAmount),
+      subTotal: dec(pricingSubTotal),
+      discount: dec(pricingDiscount),
+      tax: dec(pricingTax),
+      totalAmount: dec(payableAmount),
       paymentStatus: dto.payment.paymentStatus,
       paymentMethod: dto.payment.paymentMethod,
       transactionId: dto.payment.transactionId,
       paidAt: dto.payment.paidAt ? new Date(dto.payment.paidAt) : undefined,
-      paidAmount: dec(dto.payment.paidAmount ?? 0),
+      paidAmount: dec(paidAmount),
       bookingStatus: dto.bookingStatus ?? 'confirmed',
       notes: dto.notes,
       items: itemsPayload,
@@ -856,7 +1117,24 @@ export class BookingsService {
     );
     const booking = this.bookingRepo.create(bookingPayload);
 
-    const saved = await this.bookingRepo.save(booking);
+    let saved: Booking;
+    try {
+      saved = await this.bookingRepo.save(booking);
+    } catch (error) {
+      if (
+        error instanceof QueryFailedError &&
+        (error as any).driverError?.code === '23505' &&
+        String((error as any).driverError?.constraint || '').includes(
+          'uq_booking_items_court_start_datetime_active',
+        )
+      ) {
+        throw new ConflictException({
+          reason:
+            'Selected slot overlaps with an active booking. Please choose another time.',
+        });
+      }
+      throw error;
+    }
 
     const full = await this.bookingRepo.findOneOrFail({
       where: { id: saved.id },
@@ -866,9 +1144,9 @@ export class BookingsService {
     // Block the slots in the facility slots table
     await this.syncFacilitySlotsStatus(full);
 
-    const { locationsMap, courtToLocationMap } =
+    const { locationsMap, courtToLocationMap, locationTimeZoneMap } =
       await this.resolveLocationMapping(full);
-    return this.toApi(full, locationsMap, courtToLocationMap);
+    return this.toApi(full, locationsMap, courtToLocationMap, locationTimeZoneMap);
   }
 
   async update(
@@ -883,13 +1161,57 @@ export class BookingsService {
     if (!booking) throw new NotFoundException(`Booking ${bookingId} not found`);
 
     if (dto.bookingStatus !== undefined) {
-      booking.bookingStatus = dto.bookingStatus;
+      const requestedStatus = dto.bookingStatus;
+      if (requestedStatus === 'live') {
+        if (booking.bookingStatus === 'live') {
+          throw new ConflictException('Booking is already live.');
+        }
+        const previousItems = booking.items
+          .filter((item) => item.itemStatus !== 'cancelled')
+          .map((item) => {
+            const fallbackDate = formatDateOnly(item.date ?? booking.bookingDate);
+            const itemWindow = this.toSlotDateTimes(
+              fallbackDate,
+              item.startTime,
+              item.endTime,
+            );
+            return Object.assign(new BookingItem(), {
+              courtKind: item.courtKind,
+              courtId: item.courtId,
+              date: fallbackDate,
+              startTime: item.startTime,
+              endTime: item.endTime,
+              startDatetime: item.startDatetime ?? itemWindow.startDatetime,
+              endDatetime: item.endDatetime ?? itemWindow.endDatetime,
+            });
+          });
+
+        await this.setFacilitySlotsStatusForItems({
+          tenantId,
+          items: previousItems,
+          targetStatus: 'available',
+          excludeBookingId: booking.id,
+        });
+
+        await this.assertNoOtherLiveBookingOnFields(
+          tenantId,
+          booking.items.map((item) => ({
+            courtKind: item.courtKind,
+            courtId: item.courtId,
+            itemStatus: item.itemStatus,
+          })),
+          booking.id,
+        );
+        this.applyLiveWindowToBooking(booking);
+      } else {
+        booking.bookingStatus = requestedStatus;
+      }
       // Align every item in memory: subsequent save() cascades to booking_items, and
       // a raw SQL UPDATE would be overwritten by those stale in-memory item rows.
       let targetItemStatus: BookingItemStatus = 'confirmed';
-      if (dto.bookingStatus === 'cancelled' || dto.bookingStatus === 'no_show') {
+      if (requestedStatus === 'cancelled' || requestedStatus === 'no_show') {
         targetItemStatus = 'cancelled';
-      } else if (dto.bookingStatus === 'pending') {
+      } else if (requestedStatus === 'pending') {
         targetItemStatus = 'reserved';
       }
       for (const item of booking.items) {
@@ -899,6 +1221,24 @@ export class BookingsService {
     if (dto.notes !== undefined) booking.notes = dto.notes;
     if (dto.cancellationReason !== undefined)
       booking.cancellationReason = dto.cancellationReason;
+    if (dto.pricing) {
+      if (dto.pricing.subTotal !== undefined) {
+        booking.subTotal = dec(dto.pricing.subTotal);
+      }
+      if (dto.pricing.discount !== undefined) {
+        booking.discount = dec(dto.pricing.discount);
+      }
+      if (dto.pricing.tax !== undefined) {
+        booking.tax = dec(dto.pricing.tax);
+      }
+      booking.totalAmount = dec(
+        this.computePayableAmount(
+          numFromDec(booking.subTotal),
+          numFromDec(booking.discount),
+          numFromDec(booking.tax),
+        ),
+      );
+    }
     if (dto.payment?.paymentStatus !== undefined)
       booking.paymentStatus = dto.payment.paymentStatus;
     if (dto.payment?.paymentMethod !== undefined)
@@ -913,6 +1253,10 @@ export class BookingsService {
     if (dto.payment?.paidAmount !== undefined) {
       booking.paidAmount = dec(dto.payment.paidAmount);
     }
+    this.assertPaidAmountWithinPayable(
+      numFromDec(booking.paidAmount),
+      numFromDec(booking.totalAmount),
+    );
     harmonizePaymentStatusWithAmounts(booking);
     if (dto.itemStatuses?.length) {
       const byId = new Map(booking.items.map((i) => [i.id, i]));
@@ -934,9 +1278,78 @@ export class BookingsService {
 
     await this.syncFacilitySlotsStatus(full);
 
-    const { locationsMap, courtToLocationMap } =
+    const { locationsMap, courtToLocationMap, locationTimeZoneMap } =
       await this.resolveLocationMapping(full);
-    return this.toApi(full, locationsMap, courtToLocationMap);
+    return this.toApi(full, locationsMap, courtToLocationMap, locationTimeZoneMap, {
+      // PATCH should echo persisted status; "live" is a read-time projection only.
+      projectLiveViewStatus: false,
+    });
+  }
+
+  private applyLiveWindowToBooking(booking: Booking): void {
+    const startMinutes = getCurrentMinutesInKarachi();
+    const liveDate = getCurrentDateInKarachi();
+    booking.bookingStatus = 'live';
+    booking.bookingDate = liveDate;
+    const activeItems = (booking.items ?? []).filter(
+      (item) => item.itemStatus !== 'cancelled',
+    );
+    if (!activeItems.length) return;
+
+    const normalizedItems = activeItems.map((item) => {
+      const fallbackDate = formatDateOnly(item.date ?? booking.bookingDate);
+      const originalWindow = this.toSlotDateTimes(
+        fallbackDate,
+        item.startTime,
+        item.endTime,
+      );
+      return {
+        item,
+        originalStart: item.startDatetime ?? originalWindow.startDatetime,
+        originalEnd: item.endDatetime ?? originalWindow.endDatetime,
+      };
+    });
+    const firstStartMs = Math.min(
+      ...normalizedItems.map(({ originalStart }) => originalStart.getTime()),
+    );
+    const liveBase = new Date(`${liveDate}T00:00:00Z`);
+    liveBase.setUTCMinutes(startMinutes);
+    const liveBaseMs = liveBase.getTime();
+    const slotMinutes = Math.max(
+      1,
+      Math.min(
+        ...normalizedItems.map(({ originalStart, originalEnd }) =>
+          Math.max(
+            1,
+            Math.round((originalEnd.getTime() - originalStart.getTime()) / 60000),
+          ),
+        ),
+      ),
+    );
+
+    for (const row of normalizedItems) {
+      const durationMinutesRaw = Math.max(
+        1,
+        Math.round((row.originalEnd.getTime() - row.originalStart.getTime()) / 60000),
+      );
+      const offsetMinutesRaw = Math.max(
+        0,
+        Math.round((row.originalStart.getTime() - firstStartMs) / 60000),
+      );
+      const durationMinutes =
+        Math.max(1, Math.round(durationMinutesRaw / slotMinutes)) * slotMinutes;
+      const offsetMinutes =
+        Math.max(0, Math.round(offsetMinutesRaw / slotMinutes)) * slotMinutes;
+      const liveStartDate = new Date(liveBaseMs + offsetMinutes * 60 * 1000);
+      const liveEndDate = new Date(
+        liveStartDate.getTime() + durationMinutes * 60 * 1000,
+      );
+      row.item.date = formatDateOnly(liveStartDate);
+      row.item.startTime = liveStartDate.toISOString().slice(11, 16);
+      row.item.endTime = liveEndDate.toISOString().slice(11, 16);
+      row.item.startDatetime = liveStartDate;
+      row.item.endDatetime = liveEndDate;
+    }
   }
 
   async remove(tenantId: string, bookingId: string): Promise<{ ok: true }> {
@@ -1001,7 +1414,7 @@ export class BookingsService {
       .innerJoin('b.items', 'i')
       .where('b.tenantId = :tenantId', { tenantId })
       .andWhere('b.id <> :bookingId', { bookingId })
-      .andWhere("b.bookingStatus IN ('pending', 'confirmed', 'completed')")
+      .andWhere("b.bookingStatus IN ('pending', 'confirmed', 'live', 'completed')")
       .andWhere("i.itemStatus <> 'cancelled'")
       .andWhere('i.courtKind = :courtKind', { courtKind: baseItem.courtKind })
       .andWhere('i.courtId = :courtId', { courtId: baseItem.courtId })
@@ -1148,7 +1561,7 @@ export class BookingsService {
       .createQueryBuilder('b')
       .innerJoin('b.items', 'i')
       .where('b.tenantId = :tenantId', { tenantId })
-      .andWhere("b.bookingStatus IN ('confirmed', 'pending')")
+      .andWhere("b.bookingStatus IN ('confirmed', 'pending', 'live')")
       .andWhere("i.itemStatus IN ('confirmed', 'reserved')")
       .andWhere('i.courtKind = :courtKind', { courtKind: courtKindFilter })
       .andWhere('i.startDatetime < :queryEnd', {
@@ -1286,7 +1699,7 @@ export class BookingsService {
       .createQueryBuilder('b')
       .innerJoin('b.items', 'i')
       .andWhere('b.tenantId = :tenantId', { tenantId })
-      .andWhere("b.bookingStatus IN ('confirmed', 'pending', 'completed')")
+      .andWhere("b.bookingStatus IN ('confirmed', 'pending', 'live')")
       .andWhere("i.itemStatus <> 'cancelled'")
       .andWhere('i.courtKind = :kind', { kind: params.kind })
       .andWhere('i.courtId = :courtId', { courtId: params.courtId })
@@ -1299,6 +1712,8 @@ export class BookingsService {
         'i.id AS id',
         'i.startTime AS startTime',
         'i.endTime AS endTime',
+        'i.startDatetime AS startDatetime',
+        'i.endDatetime AS endDatetime',
         'i.itemStatus AS itemStatus',
       ])
       .getRawMany<{
@@ -1306,6 +1721,8 @@ export class BookingsService {
         id: string;
         startTime: string;
         endTime: string;
+        startDatetime: string;
+        endDatetime: string;
         itemStatus: BookingItemStatus;
       }>();
 
@@ -1315,9 +1732,19 @@ export class BookingsService {
         if (toMinutes(fs.startTime, false) >= end || toMinutes(fs.endTime, true) <= start)
           continue;
         const hit = rows.find(
-          (r) =>
-            toMinutes(r.startTime, false) < toMinutes(fs.endTime, true) &&
-            toMinutes(r.endTime, true) > toMinutes(fs.startTime, false),
+          (r) => {
+            const slotWindow = this.toSlotDateTimes(
+              date,
+              fs.startTime,
+              fs.endTime,
+            );
+            return this.isOverlapBeyondGrace(
+              new Date(r.startDatetime),
+              new Date(r.endDatetime),
+              slotWindow.startDatetime,
+              slotWindow.endDatetime,
+            );
+          },
         );
         if (hit) {
           slots.push({
@@ -1348,9 +1775,15 @@ export class BookingsService {
         const s = minutesToTimeString(m);
         const e = minutesToTimeString(m + slotStepMinutes);
         const hit = rows.find(
-          (r) =>
-            toMinutes(r.startTime, false) < toMinutes(e, true) &&
-            toMinutes(r.endTime, true) > toMinutes(s, false),
+          (r) => {
+            const slotWindow = this.toSlotDateTimes(date, s, e);
+            return this.isOverlapBeyondGrace(
+              new Date(r.startDatetime),
+              new Date(r.endDatetime),
+              slotWindow.startDatetime,
+              slotWindow.endDatetime,
+            );
+          },
         );
         if (hit) {
           slots.push({
@@ -1449,10 +1882,6 @@ export class BookingsService {
 
     if (params.availableOnly) {
       segments = segments.filter((s: any) => s.state === 'free');
-    } else {
-      // User specifically requested to not show booked slots as part of recent iteration,
-      // ensuring booked slots are purged across the board
-      segments = segments.filter((s: any) => s.state !== 'booked');
     }
 
     return {
@@ -2460,7 +2889,7 @@ export class BookingsService {
       // AND the item itself is not cancelled.
       const isBookingActive =
         booking.bookingStatus === 'confirmed' ||
-        booking.bookingStatus === 'completed' ||
+        booking.bookingStatus === 'live' ||
         booking.bookingStatus === 'pending';
       
       const isItemActive = item.itemStatus !== 'cancelled';
@@ -2525,23 +2954,219 @@ export class BookingsService {
     }
   }
 
+  private async setFacilitySlotsStatusForItems(params: {
+    tenantId: string;
+    items: BookingItem[];
+    targetStatus: CourtFacilitySlotStatus;
+    excludeBookingId?: string;
+  }): Promise<void> {
+    const { tenantId, items, targetStatus, excludeBookingId } = params;
+    if (!items.length) return;
+
+    for (const item of items) {
+      const fallbackDate = formatDateOnly(
+        item.date ?? item.startDatetime ?? item.endDatetime ?? new Date(),
+      );
+      const itemWindow = this.toSlotDateTimes(
+        fallbackDate,
+        item.startTime,
+        item.endTime,
+      );
+      const itemStart = item.startDatetime ?? itemWindow.startDatetime;
+      const itemEnd = item.endDatetime ?? itemWindow.endDatetime;
+      const startDateIso = formatDateOnly(itemStart);
+      const endDateIso = formatDateOnly(itemEnd);
+
+      for (
+        let slotDate = startDateIso;
+        slotDate <= endDateIso;
+        slotDate = addDays(slotDate, 1)
+      ) {
+        const dayStart = new Date(`${slotDate}T00:00:00Z`);
+        const nextDay = addDays(slotDate, 1);
+        const dayEnd = new Date(`${nextDay}T00:00:00Z`);
+        const windowStartDate = new Date(
+          Math.max(itemStart.getTime(), dayStart.getTime()),
+        );
+        const windowEndDate = new Date(
+          Math.min(itemEnd.getTime(), dayEnd.getTime()),
+        );
+        if (windowEndDate <= windowStartDate) continue;
+        const windowStart = windowStartDate.toISOString().slice(11, 16);
+        const windowEnd = windowEndDate.toISOString().slice(11, 16);
+        const effectiveEnd =
+          windowEnd === '00:00' && windowEndDate.getTime() === dayEnd.getTime()
+            ? '24:00'
+            : windowEnd;
+
+        if (targetStatus === 'blocked') {
+          await this.facilitySlotRepo
+            .createQueryBuilder()
+            .update(CourtFacilitySlot)
+            .set({ status: targetStatus })
+            .where('tenantId = :tenantId', { tenantId })
+            .andWhere('courtKind = :courtKind', { courtKind: item.courtKind })
+            .andWhere('courtId = :courtId', { courtId: item.courtId })
+            .andWhere('slotDate = :slotDate', { slotDate })
+            .andWhere('startTime < :endTime', { endTime: effectiveEnd })
+            .andWhere('endTime > :startTime', { startTime: windowStart })
+            .execute();
+          continue;
+        }
+
+        const candidateSlots = await this.facilitySlotRepo.find({
+          where: {
+            tenantId,
+            courtKind: item.courtKind,
+            courtId: item.courtId,
+            slotDate,
+          },
+          select: ['slotDate', 'startTime', 'endTime'],
+        });
+
+        for (const slot of candidateSlots) {
+          if (
+            toMinutes(slot.startTime, false) >= toMinutes(effectiveEnd, true) ||
+            toMinutes(slot.endTime, true) <= toMinutes(windowStart, false)
+          ) {
+            continue;
+          }
+
+          const slotStart = new Date(`${slot.slotDate}T${slot.startTime}:00Z`);
+          const slotEnd = new Date(`${slot.slotDate}T${slot.endTime}:00Z`);
+          const overlapQb = this.bookingRepo
+            .createQueryBuilder('b')
+            .innerJoin('b.items', 'i')
+            .where('b.tenantId = :tenantId', { tenantId })
+            .andWhere("b.bookingStatus IN ('pending', 'confirmed', 'live', 'completed')")
+            .andWhere("i.itemStatus <> 'cancelled'")
+            .andWhere('i.courtKind = :courtKind', { courtKind: item.courtKind })
+            .andWhere('i.courtId = :courtId', { courtId: item.courtId })
+            .andWhere('i.startDatetime < :slotEnd', {
+              slotEnd: slotEnd.toISOString(),
+            })
+            .andWhere('i.endDatetime > :slotStart', {
+              slotStart: slotStart.toISOString(),
+            });
+          if (excludeBookingId) {
+            overlapQb.andWhere('b.id <> :excludeBookingId', { excludeBookingId });
+          }
+          const overlapCount = await overlapQb.getCount();
+          if (overlapCount > 0) continue;
+
+          await this.facilitySlotRepo.update(
+            {
+              tenantId,
+              courtKind: item.courtKind,
+              courtId: item.courtId,
+              slotDate: slot.slotDate,
+              startTime: slot.startTime,
+            },
+            { status: 'available' },
+          );
+        }
+      }
+    }
+  }
+
   async completePastBookings() {
     const now = new Date();
-    
-    // Find confirmed bookings where all items have ended
-    const pastBookings = await this.bookingRepo
+
+    // Auto-cancel bookings that never started (still pending/confirmed) after end time.
+    const noShowBookings = await this.bookingRepo
       .createQueryBuilder('b')
       .innerJoin('b.items', 'i')
-      .where("b.bookingStatus = 'confirmed'")
+      .where("b.bookingStatus IN ('pending', 'confirmed')")
       .groupBy('b.id')
       .having('MAX(i.endDatetime) < :now', { now: now.toISOString() })
       .select('b.id', 'id')
-      .getRawMany();
+      .getRawMany<{ id: string }>();
+    if (noShowBookings.length > 0) {
+      const ids = noShowBookings.map((b) => b.id);
+      const rows = await this.bookingRepo.find({
+        where: { id: In(ids) },
+        relations: ['items'],
+      });
+      for (const booking of rows) {
+        booking.bookingStatus = 'cancelled';
+        booking.cancellationReason =
+          booking.cancellationReason ||
+          'Auto-cancelled because booking was not started before end time.';
+        for (const item of booking.items ?? []) {
+          item.itemStatus = 'cancelled';
+        }
+        await this.bookingRepo.save(booking);
+        await this.syncFacilitySlotsStatus(booking);
+      }
+      this.logger.log(
+        `Auto-cancelled ${rows.length} unstarted bookings past end time.`,
+      );
+    }
+
+    // Complete only live bookings once their play window has ended.
+    const pastBookings = await this.bookingRepo
+      .createQueryBuilder('b')
+      .innerJoin('b.items', 'i')
+      .where("b.bookingStatus = 'live'")
+      .groupBy('b.id')
+      .having('MAX(i.endDatetime) < :now', { now: now.toISOString() })
+      .select('b.id', 'id')
+      .getRawMany<{ id: string }>();
 
     if (pastBookings.length === 0) return;
 
     const ids = pastBookings.map((b) => b.id);
+    const liveBookings = await this.bookingRepo.find({
+      where: { id: In(ids), bookingStatus: 'live' },
+      relations: ['items'],
+    });
+    for (const booking of liveBookings) {
+      let extraSubTotal = 0;
+      for (const item of booking.items ?? []) {
+        if (item.itemStatus === 'cancelled') continue;
+        if (!item.startDatetime || !item.endDatetime) continue;
+        if (now <= item.endDatetime) continue;
+
+        const durationMinutes = Math.max(
+          1,
+          Math.round(
+            (item.endDatetime.getTime() - item.startDatetime.getTime()) / 60000,
+          ),
+        );
+        const perMinuteRate = numFromDec(item.price) / durationMinutes;
+        const overtimeMinutes = Math.max(
+          0,
+          Math.ceil((now.getTime() - item.endDatetime.getTime()) / 60000),
+        );
+        if (overtimeMinutes <= 0) continue;
+
+        const overtimeCharge = Number((perMinuteRate * overtimeMinutes).toFixed(2));
+        extraSubTotal += overtimeCharge;
+        item.price = dec(numFromDec(item.price) + overtimeCharge);
+        item.endDatetime = now;
+        item.endTime = now.toISOString().slice(11, 16);
+        item.date = now.toISOString().slice(0, 10);
+        item.itemStatus = 'cancelled';
+      }
+
+      if (extraSubTotal > 0) {
+        booking.subTotal = dec(numFromDec(booking.subTotal) + extraSubTotal);
+        booking.totalAmount = dec(
+          this.computePayableAmount(
+            numFromDec(booking.subTotal),
+            numFromDec(booking.discount),
+            numFromDec(booking.tax),
+          ),
+        );
+        harmonizePaymentStatusWithAmounts(booking);
+      }
+      await this.bookingRepo.save(booking);
+    }
     await this.bookingRepo.update({ id: In(ids) }, { bookingStatus: 'completed' });
-    this.logger.log(`Marked ${ids.length} confirmed bookings as completed.`);
+    for (const booking of liveBookings) {
+      booking.bookingStatus = 'completed';
+      await this.syncFacilitySlotsStatus(booking);
+    }
+    this.logger.log(`Marked ${ids.length} active bookings as completed.`);
   }
 }

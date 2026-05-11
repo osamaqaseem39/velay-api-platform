@@ -72,6 +72,48 @@ export function resolveTimeZoneId(raw: string | null | undefined): string {
   return 'Asia/Karachi';
 }
 
+function itemBookingYmd(booking: Booking, item: BookingItem): string {
+  const raw = item.date ?? booking.bookingDate;
+  if (raw == null || raw === '') return '';
+  return String(raw).trim().split('T')[0] ?? '';
+}
+
+/**
+ * True when `now` falls inside any non-cancelled item window, in the venue wall clock.
+ * Used to expose `BookingViewStatus` `"live"` without persisting it.
+ */
+export function bookingIsInPlayWindowNow(
+  booking: Booking,
+  locationTimeZone: string | null | undefined,
+  now: Date = new Date(),
+): boolean {
+  const status = booking.bookingStatus;
+  if (
+    status === 'cancelled' ||
+    status === 'no_show' ||
+    status === 'completed'
+  ) {
+    return false;
+  }
+  if (status !== 'confirmed') return false;
+
+  const tz = resolveTimeZoneId(locationTimeZone);
+  const nowMs = now.getTime();
+  for (const it of booking.items || []) {
+    if (it.itemStatus === 'cancelled') continue;
+    const ymd = itemBookingYmd(booking, it);
+    if (!ymd) continue;
+    const { startMs, endMs } = wallRangeToMs(
+      ymd,
+      it.startTime,
+      it.endTime,
+      tz,
+    );
+    if (startMs <= nowMs && nowMs < endMs) return true;
+  }
+  return false;
+}
+
 export type FacilityPlayStatus = 'inactive' | 'live' | 'soon' | 'idle';
 
 export type LiveBookingRef = {

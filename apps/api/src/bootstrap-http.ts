@@ -13,10 +13,12 @@ const DEFAULT_CORS_ORIGINS: readonly string[] = [
   'https://www.velay.app',
   'https://www.velay.pro',
   'https://www.vellay.app',
+  'https://www.vellay.xyz',
   'https://vellay.pro',
   'https://velay.app',
   'https://velay.pro',
   'https://vellay.app',
+  'https://vellay.xyz',
   'http://localhost:3000',
   'https://booking-saas-kappa.vercel.app'
 ];

@@ -16,12 +16,13 @@ export type BookingItemStatus = (typeof BOOKING_ITEM_STATUSES)[number];
 export const BOOKING_STATUSES = [
   'pending',
   'confirmed',
+  'live',
   'cancelled',
   'completed',
   'no_show',
 ] as const;
 export type BookingStatus = (typeof BOOKING_STATUSES)[number];
-export type BookingViewStatus = BookingStatus | 'live';
+export type BookingViewStatus = BookingStatus;
 
 export const PAYMENT_STATUSES = [
   'pending',

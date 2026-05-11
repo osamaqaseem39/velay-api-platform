@@ -193,7 +193,7 @@ export class TimeSlotTemplatesService {
       .andWhere('item.courtId IN (:...courtIds)', {
         courtIds: affectedCourtIds,
       })
-      .andWhere("booking.bookingStatus IN ('confirmed', 'pending', 'completed')")
+      .andWhere("booking.bookingStatus IN ('confirmed', 'pending', 'live', 'completed')")
       .andWhere("item.itemStatus <> 'cancelled'")
       .andWhere('item.endDatetime >= :startDateTime', {
         startDateTime: `${today}T00:00:00.000Z`,
