@@ -39,6 +39,14 @@ export class Booking {
   @Column({ type: 'date' })
   bookingDate!: string;
 
+  /** First active item start (HH:mm); whole-session wall clock, not a single segment. */
+  @Column({ type: 'varchar', length: 5, nullable: true })
+  startTime!: string | null;
+
+  /** Last active item end (HH:mm); can be earlier on the clock than startTime when play crosses midnight. */
+  @Column({ type: 'varchar', length: 5, nullable: true })
+  endTime!: string | null;
+
   @Column({ type: 'decimal', precision: 12, scale: 2 })
   subTotal!: string;
 

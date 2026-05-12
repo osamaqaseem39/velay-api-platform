@@ -114,13 +114,26 @@ export function bookingIsInPlayWindowNow(
   return false;
 }
 
-export type FacilityPlayStatus = 'inactive' | 'live' | 'soon' | 'idle';
+export type FacilityPlayStatus = 'inactive' | 'live' | 'soon' | 'idle' | 'overtime';
+
+function numFromDecLike(v: string | null | undefined): number {
+  const n = Number(v ?? 0);
+  if (!Number.isFinite(n)) return 0;
+  // DB decimals have scale=2; keep a stable 2-dec representation for clients.
+  return Math.round(n * 100) / 100;
+}
 
 export type LiveBookingRef = {
   bookingId: string;
   bookingDate: string;
   startTime: string;
   endTime: string;
+  /** Full booking total, not segment price. */
+  totalAmount: number;
+  /** Booking pricing discount (PKR). */
+  discount: number;
+  /** Remaining payable amount = totalAmount - paidAmount. */
+  remainingAmount: number;
   sportType: string;
   userDisplayName?: string;
 };
@@ -153,12 +166,9 @@ function collectItemWindows(
       if (it.courtId !== courtId) continue;
       if (it.courtKind !== courtKind) continue;
       if (it.itemStatus === 'cancelled') continue;
-      const { startMs, endMs } = wallRangeToMs(
-        b.bookingDate,
-        it.startTime,
-        it.endTime,
-        timeZone,
-      );
+      const ymd = itemBookingYmd(b, it);
+      if (!ymd) continue;
+      const { startMs, endMs } = wallRangeToMs(ymd, it.startTime, it.endTime, timeZone);
       out.push({ booking: b, item: it, startMs, endMs });
     }
   }
@@ -171,13 +181,54 @@ function hoursBetween(a: number, b: number): number {
 
 const SOON_MS = 60 * 60 * 1000;
 
-function toRef(b: Booking, it: BookingItem): LiveBookingRef {
+/** Min/max wall window for this booking on this court (all non-cancelled segments). */
+function sessionWindowOnCourt(
+  b: Booking,
+  courtKind: CourtKind,
+  courtId: string,
+  timeZone: string,
+): { startMs: number; endMs: number; startTime: string; endTime: string } | null {
+  const tz = resolveTimeZoneId(timeZone);
+  let minS = Number.POSITIVE_INFINITY;
+  let maxE = Number.NEGATIVE_INFINITY;
+  let startTime = '';
+  let endTime = '';
+  for (const it of b.items || []) {
+    if (it.courtId !== courtId || it.courtKind !== courtKind) continue;
+    if (it.itemStatus === 'cancelled') continue;
+    const ymd = itemBookingYmd(b, it);
+    if (!ymd) continue;
+    const { startMs, endMs } = wallRangeToMs(ymd, it.startTime, it.endTime, tz);
+    if (startMs < minS) {
+      minS = startMs;
+      startTime = it.startTime;
+    }
+    if (endMs > maxE) {
+      maxE = endMs;
+      endTime = it.endTime;
+    }
+  }
+  if (!startTime || !Number.isFinite(minS) || maxE <= minS) return null;
+  return { startMs: minS, endMs: maxE, startTime, endTime };
+}
+
+function liveRefFromSessionWindow(
+  b: Booking,
+  w: { startTime: string; endTime: string },
+): LiveBookingRef {
   const st = String(b.sportType || 'futsal').toLowerCase();
+  const totalAmount = numFromDecLike(b.totalAmount);
+  const discount = numFromDecLike(b.discount);
+  const paidAmount = numFromDecLike(b.paidAmount);
+  const remainingAmount = Math.max(0, Number((totalAmount - paidAmount).toFixed(2)));
   return {
     bookingId: b.id,
     bookingDate: b.bookingDate,
-    startTime: it.startTime,
-    endTime: it.endTime,
+    startTime: w.startTime,
+    endTime: w.endTime,
+    totalAmount,
+    discount,
+    remainingAmount,
     sportType: (BOOKING_SPORT_TYPES as readonly string[]).includes(st)
       ? st
       : 'futsal',
@@ -248,23 +299,65 @@ export function buildPlaySnapshot(
   let hoursBookedLast7Days = 0;
   for (const w of windows) {
     const h = hoursBetween(w.startMs, w.endMs);
-    if (w.booking.bookingDate === todayYmd) {
+    const dayKey = ymdInTimeZone(tz, new Date(w.startMs));
+    if (dayKey === todayYmd) {
       hoursBookedToday += h;
     }
-    if (weekYmds.has(w.booking.bookingDate)) {
+    if (weekYmds.has(dayKey)) {
       hoursBookedLast7Days += h;
     }
   }
 
-  const ongoing = windows.find((w) => w.startMs <= now && now < w.endMs) ?? null;
+  // Only expose a booking as `currentBooking` when it is explicitly marked `live`.
+  // Time-window math alone is not sufficient (bookings may still be `confirmed` until the venue flips them to `live`).
+  const ongoing =
+    windows.find((w) => w.startMs <= now && now < w.endMs && w.booking.bookingStatus === 'live') ?? null;
+
+  type SessionWindow = NonNullable<ReturnType<typeof sessionWindowOnCourt>>;
+
+  // If a booking is still marked `live` but its session window has already ended, treat it as `overtime`.
+  const overtime = (() => {
+    const liveBookings = Array.from(
+      new Map(
+        windows
+          .filter((w) => w.booking.bookingStatus === 'live')
+          .map((w) => [w.booking.id, w.booking] as const),
+      ).values(),
+    );
+
+    let best: { booking: Booking; sw: SessionWindow } | null = null;
+
+    for (const b of liveBookings) {
+      const sw = sessionWindowOnCourt(b, courtKind, courtId, tz);
+      if (!sw) continue;
+      if (sw.endMs > now) continue; // still within session window
+      if (!best || sw.endMs > best.sw.endMs) best = { booking: b, sw };
+    }
+
+    return best;
+  })();
+
+  // If a booking time-window has already started but it's still not marked `live`,
+  // keep it visible in `nextBooking` until the venue flips it.
+  const startedButNotLive = windows
+    .filter((w) => w.startMs <= now && now < w.endMs && w.booking.bookingStatus !== 'live')
+    .sort((a, b) => a.startMs - b.startMs);
+
   const future = windows
     .filter((w) => w.startMs > now)
     .sort((a, b) => a.startMs - b.startMs);
-  const next = future[0] ?? null;
+
+  const currentLiveBooking = ongoing ? ongoing.booking : overtime?.booking ?? null;
+
+  const next = currentLiveBooking
+    ? future.find((w) => w.booking.id !== currentLiveBooking.id) ?? null
+    : startedButNotLive[0] ?? future[0] ?? null;
 
   let playStatus: FacilityPlayStatus = 'idle';
   if (ongoing) {
     playStatus = 'live';
+  } else if (overtime) {
+    playStatus = 'overtime';
   } else if (next) {
     const ms = next.startMs - now;
     if (ms >= 0 && ms <= SOON_MS) {
@@ -272,16 +365,28 @@ export function buildPlaySnapshot(
     }
   }
 
+  const ongoingSw = ongoing
+    ? sessionWindowOnCourt(ongoing.booking, courtKind, courtId, tz)
+    : null;
+  const overtimeSw = overtime?.sw ?? null;
+  const currentSw = ongoing ? ongoingSw : overtimeSw;
+  const nextSw = next
+    ? sessionWindowOnCourt(next.booking, courtKind, courtId, tz)
+    : null;
+
   return {
     courtKind,
     courtId,
     name,
     playStatus,
-    currentBooking: ongoing ? toRef(ongoing.booking, ongoing.item) : null,
-    currentEndsAt: ongoing
-      ? new Date(ongoing.endMs).toISOString()
-      : null,
-    nextBooking: next ? toRef(next.booking, next.item) : null,
+    currentBooking:
+      ongoing && ongoingSw
+        ? liveRefFromSessionWindow(ongoing.booking, ongoingSw)
+        : overtime && overtimeSw
+          ? liveRefFromSessionWindow(overtime.booking, overtimeSw)
+          : null,
+    currentEndsAt: currentSw ? new Date(currentSw.endMs).toISOString() : null,
+    nextBooking: next && nextSw ? liveRefFromSessionWindow(next.booking, nextSw) : null,
     nextStartsAt: next ? new Date(next.startMs).toISOString() : null,
     minutesUntilNext:
       next && next.startMs > now

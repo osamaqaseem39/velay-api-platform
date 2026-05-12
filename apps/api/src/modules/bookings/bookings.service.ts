@@ -152,6 +152,9 @@ export type BookingApiRow = {
   };
   sportType: BookingSportType;
   bookingDate: string;
+  /** Whole booking wall clock: first active item `startTime` → last active item `endTime` (`HH:mm`). */
+  startTime?: string;
+  endTime?: string;
   items: Array<{
     id: string;
     date?: string;
@@ -401,6 +404,51 @@ export class BookingsService {
     return arr;
   }
 
+  private itemPlayEndMs(item: BookingItem, bookingBookingDate: string): number {
+    if (item.endDatetime) return item.endDatetime.getTime();
+    const d = formatDateOnly(item.date ?? bookingBookingDate);
+    return this.toSlotDateTimes(d, item.startTime, item.endTime).endDatetime.getTime();
+  }
+
+  /** Earliest active segment start and latest active segment end (wall `HH:mm` on their line dates). */
+  private computeBookingWindowWallTimes(booking: Booking): {
+    startTime: string;
+    endTime: string;
+  } | null {
+    const items = (booking.items ?? []).filter((i) => i.itemStatus !== 'cancelled');
+    if (!items.length) return null;
+    const bd = formatDateOnly(booking.bookingDate);
+    let minMs = Number.POSITIVE_INFINITY;
+    let maxMs = Number.NEGATIVE_INFINITY;
+    let startTime = '';
+    let endTime = '';
+    for (const it of items) {
+      const s = this.itemPlayStartMs(it, bd);
+      const e = this.itemPlayEndMs(it, bd);
+      if (s < minMs) {
+        minMs = s;
+        startTime = it.startTime;
+      }
+      if (e > maxMs) {
+        maxMs = e;
+        endTime = it.endTime;
+      }
+    }
+    if (!startTime || !endTime) return null;
+    return { startTime, endTime };
+  }
+
+  private applyBookingWindowFields(booking: Booking): void {
+    const w = this.computeBookingWindowWallTimes(booking);
+    if (w) {
+      booking.startTime = w.startTime;
+      booking.endTime = w.endTime;
+    } else {
+      booking.startTime = null;
+      booking.endTime = null;
+    }
+  }
+
   private toApi(
     booking: Booking,
     locationsMap: Record<string, string> = {},
@@ -413,6 +461,7 @@ export class BookingsService {
     const courtId = first?.courtId;
     const locationId = courtId ? courtToLocationMap[courtId] : undefined;
     const arenaId = locationId || booking.tenantId;
+    const wall = this.computeBookingWindowWallTimes(booking);
 
     return {
       bookingId: booking.id,
@@ -428,6 +477,8 @@ export class BookingsService {
         : undefined,
       sportType: booking.sportType,
       bookingDate: formatDateOnly(booking.bookingDate),
+      startTime: booking.startTime ?? wall?.startTime,
+      endTime: booking.endTime ?? wall?.endTime,
       items: timelineItems.map((it) => ({
         id: it.id,
         date: it.date,
@@ -1116,6 +1167,7 @@ export class BookingsService {
       bookingPayload as Pick<Booking, 'totalAmount' | 'paidAmount' | 'paymentStatus'>,
     );
     const booking = this.bookingRepo.create(bookingPayload);
+    this.applyBookingWindowFields(booking);
 
     let saved: Booking;
     try {
@@ -1269,6 +1321,7 @@ export class BookingsService {
         item.itemStatus = row.status;
       }
     }
+    this.applyBookingWindowFields(booking);
     const saved = await this.bookingRepo.save(booking);
 
     const full = await this.bookingRepo.findOneOrFail({
@@ -1461,12 +1514,16 @@ export class BookingsService {
         itemStatus: baseItem.itemStatus === 'cancelled' ? 'confirmed' : baseItem.itemStatus,
       });
     await this.bookingRepo.manager.getRepository(BookingItem).save(extraItem);
+    booking.items = await this.bookingRepo.manager.getRepository(BookingItem).find({
+      where: { bookingId: booking.id },
+    });
 
     booking.subTotal = dec(numFromDec(booking.subTotal) + extensionPrice);
     booking.totalAmount = dec(
       numFromDec(booking.subTotal) - numFromDec(booking.discount) + numFromDec(booking.tax),
     );
     harmonizePaymentStatusWithAmounts(booking);
+    this.applyBookingWindowFields(booking);
     await this.bookingRepo.save(booking);
 
     const full = await this.bookingRepo.findOneOrFail({
@@ -3095,6 +3152,7 @@ export class BookingsService {
         for (const item of booking.items ?? []) {
           item.itemStatus = 'cancelled';
         }
+        this.applyBookingWindowFields(booking);
         await this.bookingRepo.save(booking);
         await this.syncFacilitySlotsStatus(booking);
       }
@@ -3160,6 +3218,7 @@ export class BookingsService {
         );
         harmonizePaymentStatusWithAmounts(booking);
       }
+      this.applyBookingWindowFields(booking);
       await this.bookingRepo.save(booking);
     }
     await this.bookingRepo.update({ id: In(ids) }, { bookingStatus: 'completed' });
