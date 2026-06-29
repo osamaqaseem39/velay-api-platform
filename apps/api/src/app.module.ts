@@ -14,6 +14,7 @@ import { AuthModule } from './modules/auth/auth.module';
 import { IamModule } from './modules/iam/iam.module';
 import { PaymentsModule } from './modules/payments/payments.module';
 import { SaasSubscriptionsModule } from './modules/saas-subscriptions/saas-subscriptions.module';
+import { TournamentsModule } from './modules/tournaments/tournaments.module';
 
 import { TenancyModule } from './tenancy/tenancy.module';
 import { ScheduleModule } from '@nestjs/schedule';
@@ -185,6 +186,7 @@ function sslModeFromEnv() {
     BusinessesModule,
     PaymentsModule,
     SaasSubscriptionsModule,
+    TournamentsModule,
   ],
 })
 export class AppModule {}

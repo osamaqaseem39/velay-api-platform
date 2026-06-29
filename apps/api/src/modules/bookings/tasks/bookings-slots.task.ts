@@ -257,8 +257,8 @@ export class BookingsSlotsTask {
   }
 
   /**
-   * Run every 15 minutes to:
-   * Mark confirmed bookings as completed if their slot time has ended.
+   * Run every 10 minutes to auto-cancel unstarted bookings past their slot end.
+   * Live bookings past end stay live (overtime) until checkout.
    */
   @Cron(CronExpression.EVERY_10_MINUTES)
   async handleBookingCompletion() {

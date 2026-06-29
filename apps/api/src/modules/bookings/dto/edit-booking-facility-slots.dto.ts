@@ -8,4 +8,8 @@ export class EditBookingFacilitySlotsDto {
   @IsOptional()
   @IsIn([30, 60])
   addOnMinutes?: 30 | 60;
+
+  @IsOptional()
+  @IsIn([30, 60])
+  removeAddOnMinutes?: 30 | 60;
 }

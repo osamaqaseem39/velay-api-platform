@@ -17,4 +17,8 @@ export class UpdateUserDto {
   @IsOptional()
   @IsString()
   phone?: string;
+
+  @IsOptional()
+  @IsString()
+  profilePictureUrl?: string;
 }

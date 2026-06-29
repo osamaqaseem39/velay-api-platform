@@ -52,14 +52,14 @@ export function applyHttpGlobals(app: NestExpressApplication): void {
   app.use((req: Request, res: Response, next: NextFunction) => {
     const origin = req.headers.origin as string | undefined;
 
+    let corsAllowed = false;
     if (origin) {
-      const allowOrigin = isAllowedOrigin(origin);
-      res.setHeader(
-        'Access-Control-Allow-Origin',
-        allowOrigin ? origin : 'null',
-      );
-      res.setHeader('Vary', 'Origin');
-      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      corsAllowed = isAllowedOrigin(origin);
+      if (corsAllowed) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Vary', 'Origin');
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+      }
     }
 
     res.setHeader(
@@ -67,8 +67,6 @@ export function applyHttpGlobals(app: NestExpressApplication): void {
       'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
     );
 
-    // Let the client request headers decide which headers we allow,
-    // so preflight doesn't fail when the frontend sends extra headers.
     const requestHeaders = req.header('Access-Control-Request-Headers');
     res.setHeader(
       'Access-Control-Allow-Headers',
@@ -77,6 +75,11 @@ export function applyHttpGlobals(app: NestExpressApplication): void {
     );
 
     if (req.method === 'OPTIONS') {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      if (corsAllowed) {
+        res.setHeader('Access-Control-Max-Age', '0');
+      }
       res.status(204).send();
       return;
     }
@@ -95,8 +98,8 @@ export function applyHttpGlobals(app: NestExpressApplication): void {
     }),
   );
   app.useGlobalFilters(
-    new DatabaseQueryExceptionFilter(),
     new ApiExceptionFilter(),
+    new DatabaseQueryExceptionFilter(),
   );
 }
 

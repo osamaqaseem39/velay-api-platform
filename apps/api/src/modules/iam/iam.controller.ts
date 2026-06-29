@@ -88,7 +88,12 @@ export class IamController {
   }
 
   @Patch('users/:userId')
-  @Roles('platform-owner', 'business-admin', 'location-admin')
+  @Roles(
+    'platform-owner',
+    'business-admin',
+    'location-admin',
+    'business-staff',
+  )
   async updateUser(
     @Req() req: Request,
     @Param('userId') userId: string,

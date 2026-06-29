@@ -46,9 +46,25 @@ import type {
 import {
   addDaysYmd,
   buildPlaySnapshot,
+  computeOvertimeFromCourtSession,
+  type CourtSessionSegmentMs,
   type FacilityPlaySnapshot,
+  wallRangeToMs,
   ymdInTimeZone,
 } from './utils/facility-live-snapshot.util';
+import {
+  fetchGeminiBookingExtract,
+  isGeminiBookingParseConfigured,
+  mergeGeminiOverHeuristic,
+} from './utils/gemini-free-text-parse.util';
+import {
+  fetchOpenAiBookingExtract,
+  isOpenAiBookingParseConfigured,
+} from './utils/openai-free-text-parse.util';
+import {
+  parseFreeTextBookingMessage,
+  type FreeTextBookingParseResult,
+} from './utils/parse-free-text-booking.util';
 import { CourtFacilitySlot, CourtFacilitySlotStatus } from './entities/court-facility-slot.entity';
 import { BookingItem } from './entities/booking-item.entity';
 import { CourtSlotBookingBlock } from './entities/court-slot-booking-block.entity';
@@ -163,12 +179,17 @@ export type BookingApiRow = {
     slotId?: string;
     startTime: string;
     endTime: string;
+    basePrice: number;
+    overtimeCharge: number;
+    overtimeMinutes: number;
     price: number;
     currency: string;
     status: BookingItemStatus;
   }>;
   pricing: {
     subTotal: number;
+    baseSubTotal: number;
+    overtimeAmount: number;
     discount: number;
     tax: number;
     totalAmount: number;
@@ -182,6 +203,11 @@ export type BookingApiRow = {
     remainingAmount: number;
   };
   bookingStatus: BookingViewStatus;
+  liveOvertime?: {
+    projectedAt: string;
+    totalOvertimeMinutes: number;
+    totalOvertimeCharge: number;
+  };
   notes?: string;
   cancellationReason?: string;
   createdAt: string;
@@ -220,6 +246,12 @@ export class BookingsService {
   private static readonly MAX_BOOKING_DAYS_AHEAD = 14;
   private static readonly DEFAULT_SLOT_STEP_MINUTES = 60;
   private static readonly SLOT_OVERLAP_GRACE_MINUTES = 15;
+
+  private notifyBookingChange(
+    _tenantId: string,
+    _bookingId: string,
+    _action: string,
+  ): void {}
 
   private computePayableAmount(
     subTotal: number,
@@ -449,12 +481,95 @@ export class BookingsService {
     }
   }
 
+  private advanceLiveBookingItemEndsThroughNow(
+    booking: Booking,
+    now: Date,
+    courtToLocationMap: Record<string, string>,
+    locationTimeZoneMap: Record<string, string>,
+  ): void {
+    if (booking.bookingStatus !== 'live') return;
+    const bd = formatDateOnly(booking.bookingDate);
+    for (const item of booking.items ?? []) {
+      if (item.itemStatus === 'cancelled') continue;
+      const ymd = formatDateOnly(item.date ?? booking.bookingDate);
+      const locId = courtToLocationMap[item.courtId];
+      const rawTz = locId ? locationTimeZoneMap[locId] : undefined;
+      const endMs = rawTz?.trim()
+        ? wallRangeToMs(ymd, item.startTime, item.endTime, rawTz).endMs
+        : this.itemPlayEndMs(item, bd);
+      if (now.getTime() <= endMs) continue;
+      item.endDatetime = now;
+      item.endTime = now.toISOString().slice(11, 16);
+      item.date = formatDateOnly(now);
+    }
+  }
+
+  private computeLiveOvertimeProjection(
+    booking: Booking,
+    now: Date,
+    timeZone?: string,
+  ): {
+    perItem: Record<string, { overtimeMinutes: number; overtimeCharge: number }>;
+    totalOvertimeMinutes: number;
+    totalOvertimeCharge: number;
+    projectedAt: string;
+  } | null {
+    if (booking.bookingStatus !== 'live' && booking.bookingStatus !== 'confirmed') return null;
+
+    const tz = timeZone?.trim() || 'Asia/Karachi';
+    const bd = formatDateOnly(booking.bookingDate);
+    const perItem: Record<string, { overtimeMinutes: number; overtimeCharge: number }> = {};
+    let totalOvertimeMinutes = 0;
+    let totalOvertimeCharge = 0;
+    const nowMs = now.getTime();
+
+    const byCourt = new Map<string, CourtSessionSegmentMs[]>();
+    for (const item of booking.items ?? []) {
+      if (item.itemStatus === 'cancelled') continue;
+      const { startMs, endMs } = wallRangeToMs(
+        item.date ?? bd,
+        item.startTime,
+        item.endTime,
+        tz,
+      );
+      const key = `${item.courtKind}:${item.courtId}`;
+      const list = byCourt.get(key) ?? [];
+      list.push({
+        itemId: item.id,
+        startMs,
+        endMs,
+        price: numFromDec(item.price),
+      });
+      byCourt.set(key, list);
+    }
+
+    for (const segments of byCourt.values()) {
+      const ot = computeOvertimeFromCourtSession(nowMs, segments);
+      if (ot.minutes <= 0 || ot.charge <= 0 || !ot.lastItemId) continue;
+      perItem[ot.lastItemId] = {
+        overtimeMinutes: ot.minutes,
+        overtimeCharge: ot.charge,
+      };
+      totalOvertimeMinutes += ot.minutes;
+      totalOvertimeCharge += ot.charge;
+    }
+
+    if (totalOvertimeCharge <= 0) return null;
+
+    return {
+      perItem,
+      totalOvertimeMinutes,
+      totalOvertimeCharge: Number(totalOvertimeCharge.toFixed(2)),
+      projectedAt: now.toISOString(),
+    };
+  }
+
   private toApi(
     booking: Booking,
     locationsMap: Record<string, string> = {},
     courtToLocationMap: Record<string, string> = {},
     locationTimeZoneMap: Record<string, string> = {},
-    opts?: { projectLiveViewStatus?: boolean },
+    opts?: { projectLiveViewStatus?: boolean; projectLiveOvertimePricing?: boolean },
   ): BookingApiRow {
     const timelineItems = this.sortBookingItemsForTimeline(booking);
     const first = timelineItems[0];
@@ -462,6 +577,35 @@ export class BookingsService {
     const locationId = courtId ? courtToLocationMap[courtId] : undefined;
     const arenaId = locationId || booking.tenantId;
     const wall = this.computeBookingWindowWallTimes(booking);
+
+    const timeZone = locationId ? locationTimeZoneMap[locationId] : undefined;
+    const projection =
+      opts?.projectLiveOvertimePricing === true
+        ? this.computeLiveOvertimeProjection(booking, new Date(), timeZone)
+        : null;
+    const extraOvertime = projection?.totalOvertimeCharge ?? 0;
+    const baseSubTotal = numFromDec(booking.subTotal);
+    const discountN = numFromDec(booking.discount);
+    const taxN = numFromDec(booking.tax);
+    const baseTotal = numFromDec(booking.totalAmount);
+    const useOvertimePricing = Boolean(projection && extraOvertime > 0);
+    const projectedSubTotal = useOvertimePricing
+      ? Number((baseSubTotal + extraOvertime).toFixed(2))
+      : baseSubTotal;
+    const projectedTotal = useOvertimePricing
+      ? this.computePayableAmount(projectedSubTotal, discountN, taxN)
+      : baseTotal;
+
+    let paymentStatusOut = booking.paymentStatus;
+    if (useOvertimePricing) {
+      const ph = {
+        totalAmount: dec(projectedTotal),
+        paidAmount: booking.paidAmount,
+        paymentStatus: booking.paymentStatus,
+      };
+      harmonizePaymentStatusWithAmounts(ph);
+      paymentStatusOut = ph.paymentStatus;
+    }
 
     return {
       bookingId: booking.id,
@@ -479,39 +623,67 @@ export class BookingsService {
       bookingDate: formatDateOnly(booking.bookingDate),
       startTime: booking.startTime ?? wall?.startTime,
       endTime: booking.endTime ?? wall?.endTime,
-      items: timelineItems.map((it) => ({
-        id: it.id,
-        date: it.date,
-        courtKind: it.courtKind,
-        courtId: it.courtId,
-        slotId: it.slotId,
-        startTime: it.startTime,
-        endTime: it.endTime,
-        price: numFromDec(it.price),
-        currency: it.currency,
-        status: it.itemStatus,
-      })),
+      items: timelineItems.map((it) => {
+        const o = projection?.perItem[it.id];
+        const basePrice = numFromDec(it.price);
+        const overtimeCharge = o ? o.overtimeCharge : 0;
+        const overtimeMinutes = o ? o.overtimeMinutes : 0;
+        const price = o
+          ? Number((basePrice + overtimeCharge).toFixed(2))
+          : basePrice;
+        return {
+          id: it.id,
+          date: it.date,
+          courtKind: it.courtKind,
+          courtId: it.courtId,
+          slotId: it.slotId,
+          startTime: it.startTime,
+          endTime: it.endTime,
+          basePrice,
+          overtimeCharge,
+          overtimeMinutes,
+          price,
+          currency: it.currency,
+          status: it.itemStatus,
+        };
+      }),
       pricing: {
-        subTotal: numFromDec(booking.subTotal),
-        discount: numFromDec(booking.discount),
-        tax: numFromDec(booking.tax),
-        totalAmount: numFromDec(booking.totalAmount),
+        subTotal: useOvertimePricing ? projectedSubTotal : baseSubTotal,
+        baseSubTotal,
+        overtimeAmount: useOvertimePricing ? extraOvertime : 0,
+        discount: discountN,
+        tax: taxN,
+        totalAmount: useOvertimePricing ? projectedTotal : baseTotal,
       },
       payment: {
-        paymentStatus: booking.paymentStatus,
+        paymentStatus: paymentStatusOut,
         paymentMethod: booking.paymentMethod,
         transactionId: booking.transactionId,
         paidAt: booking.paidAt?.toISOString(),
         paidAmount: numFromDec(booking.paidAmount),
-        remainingAmount: numFromDec(booking.totalAmount) - numFromDec(booking.paidAmount),
+        remainingAmount: useOvertimePricing
+          ? Math.max(
+              0,
+              Number((projectedTotal - numFromDec(booking.paidAmount)).toFixed(2)),
+            )
+          : numFromDec(booking.totalAmount) - numFromDec(booking.paidAmount),
       },
       bookingStatus:
         opts?.projectLiveViewStatus === false
           ? booking.bookingStatus
           : this.resolveBookingViewStatus(
               booking,
-              locationId ? locationTimeZoneMap[locationId] : undefined,
+              timeZone,
             ),
+      ...(useOvertimePricing && projection
+        ? {
+            liveOvertime: {
+              projectedAt: projection.projectedAt,
+              totalOvertimeMinutes: projection.totalOvertimeMinutes,
+              totalOvertimeCharge: projection.totalOvertimeCharge,
+            },
+          }
+        : {}),
       notes: booking.notes,
       cancellationReason: booking.cancellationReason,
       createdAt: booking.createdAt.toISOString(),
@@ -523,7 +695,16 @@ export class BookingsService {
     booking: Booking,
     locationTimeZone?: string,
   ): BookingViewStatus {
-    void locationTimeZone;
+    if (booking.bookingStatus === 'live' || booking.bookingStatus === 'confirmed') {
+      const projection = this.computeLiveOvertimeProjection(
+        booking,
+        new Date(),
+        locationTimeZone,
+      );
+      if (projection && projection.totalOvertimeMinutes > 0) {
+        return 'overtime';
+      }
+    }
     return booking.bookingStatus;
   }
 
@@ -612,7 +793,9 @@ export class BookingsService {
     const { locationsMap, courtToLocationMap, locationTimeZoneMap } =
       await this.resolveLocationMapping(row);
 
-    return this.toApi(row, locationsMap, courtToLocationMap, locationTimeZoneMap);
+    return this.toApi(row, locationsMap, courtToLocationMap, locationTimeZoneMap, {
+      projectLiveOvertimePricing: true,
+    });
   }
 
   private async assertPadelCourtExists(
@@ -719,14 +902,14 @@ export class BookingsService {
     bookingDate: string,
     startTime: string,
     endTime: string,
+    timeZone: string = 'Asia/Karachi',
   ) {
     const date = formatDateOnly(bookingDate);
-    const overnight = toMinutes(endTime) <= toMinutes(startTime);
+    const tz = timeZone.trim() || 'Asia/Karachi';
+    const { startMs, endMs } = wallRangeToMs(date, startTime, endTime, tz);
     return {
-      startDatetime: new Date(`${date}T${startTime}:00Z`),
-      endDatetime: new Date(
-        `${overnight ? addDays(date, 1) : date}T${endTime}:00Z`,
-      ),
+      startDatetime: new Date(startMs),
+      endDatetime: new Date(endMs),
     };
   }
 
@@ -1274,22 +1457,56 @@ export class BookingsService {
     if (dto.cancellationReason !== undefined)
       booking.cancellationReason = dto.cancellationReason;
     if (dto.pricing) {
-      if (dto.pricing.subTotal !== undefined) {
-        booking.subTotal = dec(dto.pricing.subTotal);
+      const hasPart =
+        dto.pricing.subTotal !== undefined ||
+        dto.pricing.discount !== undefined ||
+        dto.pricing.tax !== undefined;
+      const totalOnly =
+        dto.pricing.totalAmount !== undefined && !hasPart;
+
+      if (totalOnly) {
+        const t = Number(dto.pricing.totalAmount);
+        if (!Number.isFinite(t) || t < 0) {
+          throw new BadRequestException('pricing.totalAmount must be a non-negative number.');
+        }
+        const prevTotal = numFromDec(booking.totalAmount);
+        booking.totalAmount = dec(t);
+        booking.subTotal = dec(
+          numFromDec(booking.totalAmount) +
+            numFromDec(booking.discount) -
+            numFromDec(booking.tax),
+        );
+        if (
+          booking.bookingStatus === 'live' &&
+          t > prevTotal + 0.005
+        ) {
+          const { courtToLocationMap, locationTimeZoneMap } =
+            await this.resolveLocationMapping(booking);
+          this.advanceLiveBookingItemEndsThroughNow(
+            booking,
+            new Date(),
+            courtToLocationMap,
+            locationTimeZoneMap,
+          );
+        }
+      } else {
+        if (dto.pricing.subTotal !== undefined) {
+          booking.subTotal = dec(dto.pricing.subTotal);
+        }
+        if (dto.pricing.discount !== undefined) {
+          booking.discount = dec(dto.pricing.discount);
+        }
+        if (dto.pricing.tax !== undefined) {
+          booking.tax = dec(dto.pricing.tax);
+        }
+        booking.totalAmount = dec(
+          this.computePayableAmount(
+            numFromDec(booking.subTotal),
+            numFromDec(booking.discount),
+            numFromDec(booking.tax),
+          ),
+        );
       }
-      if (dto.pricing.discount !== undefined) {
-        booking.discount = dec(dto.pricing.discount);
-      }
-      if (dto.pricing.tax !== undefined) {
-        booking.tax = dec(dto.pricing.tax);
-      }
-      booking.totalAmount = dec(
-        this.computePayableAmount(
-          numFromDec(booking.subTotal),
-          numFromDec(booking.discount),
-          numFromDec(booking.tax),
-        ),
-      );
     }
     if (dto.payment?.paymentStatus !== undefined)
       booking.paymentStatus = dto.payment.paymentStatus;
@@ -1397,9 +1614,27 @@ export class BookingsService {
       const liveEndDate = new Date(
         liveStartDate.getTime() + durationMinutes * 60 * 1000,
       );
-      row.item.date = formatDateOnly(liveStartDate);
-      row.item.startTime = liveStartDate.toISOString().slice(11, 16);
-      row.item.endTime = liveEndDate.toISOString().slice(11, 16);
+
+      // Use Intl.DateTimeFormat to get HH:mm in the venue's timezone
+      const timeFormatter = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'Asia/Karachi', // Fallback to Karachi for now, ideally use location timezone
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      });
+
+      const startParts = timeFormatter.formatToParts(liveStartDate);
+      const endParts = timeFormatter.formatToParts(liveEndDate);
+
+      const getHhMm = (parts: Intl.DateTimeFormatPart[]) => {
+        const h = parts.find((p) => p.type === 'hour')?.value;
+        const m = parts.find((p) => p.type === 'minute')?.value;
+        return `${h}:${m}`;
+      };
+
+      row.item.date = ymdInTimeZone('Asia/Karachi', liveStartDate);
+      row.item.startTime = getHhMm(startParts);
+      row.item.endTime = getHhMm(endParts);
       row.item.startDatetime = liveStartDate;
       row.item.endDatetime = liveEndDate;
     }
@@ -1430,7 +1665,17 @@ export class BookingsService {
     bookingId: string,
     blocked: boolean,
     addOnMinutes?: 30 | 60,
-  ): Promise<{ ok: true; bookingId: string; blocked: boolean; extendedBy?: number }> {
+    removeAddOnMinutes?: 30 | 60,
+  ): Promise<{
+    ok: true;
+    bookingId: string;
+    blocked: boolean;
+    extendedBy?: number;
+    removedBy?: number;
+  }> {
+    if (removeAddOnMinutes) {
+      return this.removeBookingTimeExtension(tenantId, bookingId, removeAddOnMinutes);
+    }
     if (!addOnMinutes) {
       return { ok: true, bookingId, blocked };
     }
@@ -1531,8 +1776,107 @@ export class BookingsService {
       relations: ['items'],
     });
     await this.syncFacilitySlotsStatus(full);
+    this.notifyBookingChange(tenantId, bookingId, 'updated');
 
     return { ok: true, bookingId, blocked, extendedBy: addOnMinutes };
+  }
+
+  private async removeBookingTimeExtension(
+    tenantId: string,
+    bookingId: string,
+    removeMinutes: 30 | 60,
+  ): Promise<{ ok: true; bookingId: string; blocked: boolean; removedBy: number }> {
+    const booking = await this.bookingRepo.findOne({
+      where: { id: bookingId, tenantId },
+      relations: ['items'],
+    });
+    if (!booking) {
+      throw new NotFoundException(`Booking ${bookingId} not found`);
+    }
+    if (!booking.items?.length) {
+      throw new BadRequestException('Booking has no items to update');
+    }
+    if (booking.bookingStatus === 'cancelled' || booking.bookingStatus === 'no_show') {
+      throw new BadRequestException('Only active bookings can be updated');
+    }
+
+    const itemsSorted = [...booking.items]
+      .filter((i) => i.itemStatus !== 'cancelled')
+      .sort((a, b) => {
+        const aStart = (
+          a.startDatetime ??
+          this.toSlotDateTimes(formatDateOnly(a.date ?? booking.bookingDate), a.startTime, a.endTime)
+            .startDatetime
+        ).getTime();
+        const bStart = (
+          b.startDatetime ??
+          this.toSlotDateTimes(formatDateOnly(b.date ?? booking.bookingDate), b.startTime, b.endTime)
+            .startDatetime
+        ).getTime();
+        return aStart - bStart;
+      });
+
+    if (itemsSorted.length < 2) {
+      throw new BadRequestException('No time extension to remove');
+    }
+
+    const last = itemsSorted[itemsSorted.length - 1]!;
+    const prev = itemsSorted[itemsSorted.length - 2]!;
+    const lastWindow = this.toSlotDateTimes(
+      formatDateOnly(last.date ?? booking.bookingDate),
+      last.startTime,
+      last.endTime,
+    );
+    const durationMinutes = Math.max(
+      1,
+      Math.round(
+        (lastWindow.endDatetime.getTime() - lastWindow.startDatetime.getTime()) / 60000,
+      ),
+    );
+    if (durationMinutes !== removeMinutes) {
+      throw new BadRequestException(
+        `Last segment is ${durationMinutes} minutes; cannot remove ${removeMinutes} minutes`,
+      );
+    }
+
+    const prevEndHm = (prev.endDatetime ?? this.toSlotDateTimes(
+      formatDateOnly(prev.date ?? booking.bookingDate),
+      prev.startTime,
+      prev.endTime,
+    ).endDatetime)
+      .toISOString()
+      .slice(11, 16);
+    const lastStartHm = (last.startDatetime ?? lastWindow.startDatetime)
+      .toISOString()
+      .slice(11, 16);
+    if (prevEndHm !== lastStartHm) {
+      throw new BadRequestException('Last segment is not a contiguous time extension');
+    }
+
+    const removedPrice = numFromDec(last.price);
+    await this.bookingRepo.manager.getRepository(BookingItem).remove(last);
+    booking.items = await this.bookingRepo.manager.getRepository(BookingItem).find({
+      where: { bookingId: booking.id },
+    });
+
+    booking.subTotal = dec(Math.max(0, numFromDec(booking.subTotal) - removedPrice));
+    booking.totalAmount = dec(
+      Math.max(
+        0,
+        numFromDec(booking.subTotal) - numFromDec(booking.discount) + numFromDec(booking.tax),
+      ),
+    );
+    harmonizePaymentStatusWithAmounts(booking);
+    this.applyBookingWindowFields(booking);
+    await this.bookingRepo.save(booking);
+
+    const full = await this.bookingRepo.findOneOrFail({
+      where: { id: bookingId, tenantId },
+      relations: ['items'],
+    });
+    await this.syncFacilitySlotsStatus(full);
+    this.notifyBookingChange(tenantId, bookingId, 'updated');
+    return { ok: true, bookingId, blocked: false, removedBy: removeMinutes };
   }
 
   async getAvailabilityByTime(
@@ -3161,71 +3505,336 @@ export class BookingsService {
       );
     }
 
-    // Complete only live bookings once their play window has ended.
-    const pastBookings = await this.bookingRepo
-      .createQueryBuilder('b')
-      .innerJoin('b.items', 'i')
-      .where("b.bookingStatus = 'live'")
-      .groupBy('b.id')
-      .having('MAX(i.endDatetime) < :now', { now: now.toISOString() })
-      .select('b.id', 'id')
-      .getRawMany<{ id: string }>();
+  }
 
-    if (pastBookings.length === 0) return;
-
-    const ids = pastBookings.map((b) => b.id);
-    const liveBookings = await this.bookingRepo.find({
-      where: { id: In(ids), bookingStatus: 'live' },
-      relations: ['items'],
+  private async matchPadelCourtFromParsedText(params: {
+    tenantId: string;
+    rawText: string;
+    courtPhrase: string | null;
+    courtNumber: number | null;
+    businessLocationId?: string;
+  }): Promise<{
+    courtId: string | null;
+    courtName: string | null;
+    candidatesConsidered: number;
+    ambiguous: boolean;
+    weakDefaultResolution?: boolean;
+  }> {
+    const { tenantId, rawText, courtPhrase, courtNumber, businessLocationId } =
+      params;
+    const where: { tenantId: string; isActive: boolean; businessLocationId?: string } =
+      { tenantId, isActive: true };
+    if (businessLocationId?.trim()) {
+      where.businessLocationId = businessLocationId.trim();
+    }
+    const courts = await this.padelRepo.find({
+      where,
+      select: ['id', 'name', 'arenaLabel'],
     });
-    for (const booking of liveBookings) {
-      let extraSubTotal = 0;
-      for (const item of booking.items ?? []) {
-        if (item.itemStatus === 'cancelled') continue;
-        if (!item.startDatetime || !item.endDatetime) continue;
-        if (now <= item.endDatetime) continue;
-
-        const durationMinutes = Math.max(
-          1,
-          Math.round(
-            (item.endDatetime.getTime() - item.startDatetime.getTime()) / 60000,
-          ),
-        );
-        const perMinuteRate = numFromDec(item.price) / durationMinutes;
-        const overtimeMinutes = Math.max(
-          0,
-          Math.ceil((now.getTime() - item.endDatetime.getTime()) / 60000),
-        );
-        if (overtimeMinutes <= 0) continue;
-
-        const overtimeCharge = Number((perMinuteRate * overtimeMinutes).toFixed(2));
-        extraSubTotal += overtimeCharge;
-        item.price = dec(numFromDec(item.price) + overtimeCharge);
-        item.endDatetime = now;
-        item.endTime = now.toISOString().slice(11, 16);
-        item.date = now.toISOString().slice(0, 10);
-        item.itemStatus = 'cancelled';
-      }
-
-      if (extraSubTotal > 0) {
-        booking.subTotal = dec(numFromDec(booking.subTotal) + extraSubTotal);
-        booking.totalAmount = dec(
-          this.computePayableAmount(
-            numFromDec(booking.subTotal),
-            numFromDec(booking.discount),
-            numFromDec(booking.tax),
-          ),
-        );
-        harmonizePaymentStatusWithAmounts(booking);
-      }
-      this.applyBookingWindowFields(booking);
-      await this.bookingRepo.save(booking);
+    if (!courts.length) {
+      return {
+        courtId: null,
+        courtName: null,
+        candidatesConsidered: 0,
+        ambiguous: false,
+      };
     }
-    await this.bookingRepo.update({ id: In(ids) }, { bookingStatus: 'completed' });
-    for (const booking of liveBookings) {
-      booking.bookingStatus = 'completed';
-      await this.syncFacilitySlotsStatus(booking);
+    const textL = rawText.toLowerCase();
+    const phraseL = (courtPhrase ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const scored: Array<{ id: string; name: string; score: number }> = [];
+    for (const c of courts) {
+      const nl = c.name.toLowerCase();
+      const al = (c.arenaLabel ?? '').toLowerCase();
+      let score = 0;
+      if (phraseL && nl === phraseL) score += 220;
+      if (phraseL && nl.includes(phraseL)) score += 160;
+      if (phraseL && phraseL.includes(nl)) score += 140;
+      if (phraseL) {
+        const short = phraseL.replace(/^padel\s+/i, '').trim();
+        if (short && nl.includes(short)) score += 100;
+      }
+      if (textL.includes(nl)) score += 40;
+      if (al && textL.includes(al)) score += 35;
+      if (courtNumber != null) {
+        const n = courtNumber;
+        if (new RegExp(`(?:court|^|\\s)0*${n}(?:\\s|$|-)`, 'i').test(c.name)) {
+          score += 90;
+        }
+        if (nl.includes(`court ${n}`) || nl.endsWith(` ${n}`) || nl.endsWith(`-${n}`)) {
+          score += 85;
+        }
+      }
+      if (score > 0) scored.push({ id: c.id, name: c.name, score });
     }
-    this.logger.log(`Marked ${ids.length} active bookings as completed.`);
+    if (!scored.length && courtNumber != null) {
+      for (const c of courts) {
+        if (c.name.includes(String(courtNumber))) {
+          scored.push({ id: c.id, name: c.name, score: 8 });
+        }
+      }
+    }
+    scored.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+    const top = scored[0];
+    const second = scored[1];
+    if (!top || top.score < 8) {
+      return {
+        courtId: null,
+        courtName: null,
+        candidatesConsidered: courts.length,
+        ambiguous: false,
+      };
+    }
+    const ambiguous = Boolean(second && second.score >= top.score - 4);
+    if (ambiguous && top.score <= 45) {
+      return {
+        courtId: top.id,
+        courtName: top.name,
+        candidatesConsidered: courts.length,
+        ambiguous: false,
+        weakDefaultResolution: true,
+      };
+    }
+    if (ambiguous) {
+      return {
+        courtId: null,
+        courtName: null,
+        candidatesConsidered: courts.length,
+        ambiguous: true,
+      };
+    }
+    return {
+      courtId: top.id,
+      courtName: top.name,
+      candidatesConsidered: courts.length,
+      ambiguous: false,
+    };
+  }
+
+  private async matchTurfCourtFromParsedText(params: {
+    tenantId: string;
+    rawText: string;
+    courtPhrase: string | null;
+    courtNumber: number | null;
+    businessLocationId?: string;
+    preferredSport: 'futsal' | 'cricket';
+  }): Promise<{
+    courtId: string | null;
+    courtName: string | null;
+    candidatesConsidered: number;
+    ambiguous: boolean;
+  }> {
+    const { tenantId, rawText, courtPhrase, courtNumber, businessLocationId, preferredSport } =
+      params;
+    const where: { tenantId: string; status: any; branchId?: string } = {
+      tenantId,
+      status: 'active',
+    };
+    if (businessLocationId?.trim()) {
+      where.branchId = businessLocationId.trim();
+    }
+    let courts = await this.turfRepo.find({
+      where,
+      select: ['id', 'name', 'supportedSports'],
+    });
+    const sportFiltered = courts.filter((c) => {
+      const ss = c.supportedSports ?? [];
+      if (!ss.length) return true;
+      return ss.includes(preferredSport);
+    });
+    if (sportFiltered.length) courts = sportFiltered;
+
+    if (!courts.length) {
+      return {
+        courtId: null,
+        courtName: null,
+        candidatesConsidered: 0,
+        ambiguous: false,
+      };
+    }
+    const textL = rawText.toLowerCase();
+    const phraseL = (courtPhrase ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const scored: Array<{ id: string; name: string; score: number }> = [];
+    for (const c of courts) {
+      const nl = c.name.toLowerCase();
+      let score = 0;
+      if (phraseL && nl === phraseL) score += 220;
+      if (phraseL && nl.includes(phraseL)) score += 160;
+      if (phraseL && phraseL.includes(nl)) score += 140;
+      if (phraseL) {
+        const short = phraseL
+          .replace(/^(?:padel|futsal|cricket|turf)\s+/i, '')
+          .trim();
+        if (short && nl.includes(short)) score += 100;
+      }
+      if (textL.includes(nl)) score += 40;
+      if (courtNumber != null) {
+        const n = courtNumber;
+        if (new RegExp(`(?:court|^|\\s)0*${n}(?:\\s|$|-)`, 'i').test(c.name)) {
+          score += 90;
+        }
+        if (nl.includes(`court ${n}`) || nl.endsWith(` ${n}`) || nl.endsWith(`-${n}`)) {
+          score += 85;
+        }
+      }
+      if (score > 0) scored.push({ id: c.id, name: c.name, score });
+    }
+    if (!scored.length && courtNumber != null) {
+      for (const c of courts) {
+        if (c.name.includes(String(courtNumber))) {
+          scored.push({ id: c.id, name: c.name, score: 8 });
+        }
+      }
+    }
+    scored.sort((a, b) => b.score - a.score);
+    const top = scored[0];
+    const second = scored[1];
+    if (!top || top.score < 8) {
+      return {
+        courtId: null,
+        courtName: null,
+        candidatesConsidered: courts.length,
+        ambiguous: false,
+      };
+    }
+    const ambiguous = Boolean(second && second.score >= top.score - 4);
+    if (ambiguous) {
+      return {
+        courtId: null,
+        courtName: null,
+        candidatesConsidered: courts.length,
+        ambiguous: true,
+      };
+    }
+    return {
+      courtId: top.id,
+      courtName: top.name,
+      candidatesConsidered: courts.length,
+      ambiguous: false,
+    };
+  }
+
+  async parseFreeTextBooking(input: {
+    tenantId: string;
+    message: string;
+    referenceDateYmd?: string;
+    businessLocationId?: string;
+  }): Promise<
+    FreeTextBookingParseResult & {
+      courtId: string | null;
+      courtName: string | null;
+      courtKind: CourtKind | null;
+      ambiguousCourt: boolean;
+    }
+  > {
+    const ref = input.referenceDateYmd?.trim() || getCurrentDateInKarachi();
+    let parsed = parseFreeTextBookingMessage(input.message, ref);
+    const mergeLlmIfPresent = async (
+      label: 'OpenAI' | 'Gemini',
+      fetcher: () => Promise<
+        (Partial<FreeTextBookingParseResult> & { formattedSummary?: string | null }) | null
+      >,
+    ) => {
+      try {
+        const llm = await fetcher();
+        if (llm) {
+          const hasLlmValue = Object.entries(llm).some(([, v]) => {
+            if (v == null) return false;
+            if (typeof v === 'string') return v.trim().length > 0;
+            if (typeof v === 'number') return Number.isFinite(v);
+            return false;
+          });
+          if (hasLlmValue) {
+            parsed = mergeGeminiOverHeuristic(parsed, llm, input.message.trim());
+          }
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        parsed.warnings.push(`${label}: ${msg} — using rule-based fields only.`);
+        this.logger.warn(`${label} booking parse failed: ${msg}`);
+      }
+    };
+    if (isOpenAiBookingParseConfigured()) {
+      await mergeLlmIfPresent('OpenAI', () =>
+        fetchOpenAiBookingExtract(input.message, ref),
+      );
+    } else if (isGeminiBookingParseConfigured()) {
+      await mergeLlmIfPresent('Gemini', () =>
+        fetchGeminiBookingExtract(input.message, ref),
+      );
+    }
+    const todayKhi = getCurrentDateInKarachi();
+    if (parsed.bookingDate && formatDateOnly(parsed.bookingDate) < todayKhi) {
+      parsed.warnings.push(
+        'Booking date is before today (Asia/Karachi). Choose today or a future date before creating.',
+      );
+    }
+    if (parsed.startTime && parsed.endTime) {
+      const spanMinutes = diffMinutes(parsed.startTime, parsed.endTime);
+      if (spanMinutes < 60) {
+        parsed.warnings.push(
+          'Parsed time range is under 1 hour. Extend the window to at least 60 minutes before creating.',
+        );
+      }
+    }
+    let courtId: string | null = null;
+    let courtName: string | null = null;
+    let courtKind: CourtKind | null = null;
+    let ambiguousCourt = false;
+    if (parsed.inferredSport === 'padel') {
+      const match = await this.matchPadelCourtFromParsedText({
+        tenantId: input.tenantId,
+        rawText: input.message,
+        courtPhrase: parsed.courtPhrase,
+        courtNumber: parsed.courtNumber,
+        businessLocationId: input.businessLocationId,
+      });
+      ambiguousCourt = match.ambiguous;
+      if (match.ambiguous) {
+        parsed.warnings.push(
+          'Multiple padel courts matched the text; choose the facility manually.',
+        );
+      } else if (match.courtId) {
+        courtId = match.courtId;
+        courtName = match.courtName;
+        courtKind = 'padel_court';
+        if (match.weakDefaultResolution) {
+          parsed.warnings.push(
+            'Several padel venues scored equally; one was chosen by default. Verify the court before saving.',
+          );
+        }
+      } else if (match.candidatesConsidered > 0) {
+        parsed.warnings.push(
+          'Could not match a padel court name to your venues; select the court manually.',
+        );
+      }
+    } else if (parsed.inferredSport === 'futsal' || parsed.inferredSport === 'cricket') {
+      const match = await this.matchTurfCourtFromParsedText({
+        tenantId: input.tenantId,
+        rawText: input.message,
+        courtPhrase: parsed.courtPhrase,
+        courtNumber: parsed.courtNumber,
+        businessLocationId: input.businessLocationId,
+        preferredSport: parsed.inferredSport,
+      });
+      ambiguousCourt = match.ambiguous;
+      if (match.ambiguous) {
+        parsed.warnings.push(
+          'Multiple turf courts matched the text; choose the facility manually.',
+        );
+      } else if (match.courtId) {
+        courtId = match.courtId;
+        courtName = match.courtName;
+        courtKind = 'turf_court';
+      } else if (match.candidatesConsidered > 0) {
+        parsed.warnings.push(
+          'Could not match a turf court name to your venues for this sport; select the court manually.',
+        );
+      }
+    } else if (parsed.inferredSport) {
+      parsed.warnings.push(
+        'Only padel and turf (futsal/cricket) courts are auto-resolved from free text today; pick table tennis manually.',
+      );
+    }
+    return { ...parsed, courtId, courtName, courtKind, ambiguousCourt };
   }
 }

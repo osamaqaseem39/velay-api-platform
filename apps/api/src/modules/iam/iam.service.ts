@@ -80,6 +80,7 @@ export class IamService implements OnModuleInit {
       fullName: user.fullName,
       email: user.email,
       phone: user.phone,
+      profilePictureUrl: user.profilePictureUrl ?? null,
       isActive: user.isActive,
       roles: roleRows.map((r) => r.roleCode),
       locationId,
@@ -373,6 +374,9 @@ export class IamService implements OnModuleInit {
 
     if (dto.fullName !== undefined) user.fullName = dto.fullName;
     if (dto.phone !== undefined) user.phone = dto.phone;
+    if (dto.profilePictureUrl !== undefined) {
+      user.profilePictureUrl = dto.profilePictureUrl.trim() || null;
+    }
     if (dto.password !== undefined) {
       user.passwordHash = await bcrypt.hash(dto.password, 10);
     }

@@ -4,17 +4,29 @@ import type { Booking } from '../entities/booking.entity';
 import type { BookingItem } from '../entities/booking-item.entity';
 
 /** Offset suffix for `Date.parse` (expand as venues grow). */
-const IANA_TO_UTC_OFFSET: Record<string, string> = {
-  'Asia/Karachi': '+05:00',
-  'Asia/Dubai': '+04:00',
-  'UTC': 'Z',
-  'Etc/UTC': 'Z',
-};
-
 function offsetSuffixForTimeZone(tz: string | null | undefined): string {
-  const t = (tz || '').trim();
-  if (!t) return '+05:00';
-  return IANA_TO_UTC_OFFSET[t] ?? '+05:00';
+  const id = (tz || '').trim() || 'Asia/Karachi';
+  try {
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: id,
+      timeZoneName: 'shortOffset',
+    });
+    const parts = formatter.formatToParts(new Date());
+    const offset = parts.find((p) => p.type === 'timeZoneName')?.value || '';
+    
+    if (offset === 'GMT' || offset === 'UTC' || !offset) return 'Z';
+    
+    // Handle formats like "GMT+5", "+05:00", "UTC+5", "GMT-08:00"
+    const match = offset.match(/([+-])(\d+)(?::?(\d+))?/);
+    if (!match) return '+05:00'; // Fallback to Karachi
+
+    const sign = match[1];
+    const hh = match[2].padStart(2, '0');
+    const mm = (match[3] || '00').padStart(2, '0');
+    return `${sign}${hh}:${mm}`;
+  } catch (e) {
+    return '+05:00';
+  }
 }
 
 function pad2(n: number) {
@@ -58,18 +70,25 @@ export function wallRangeToMs(
 
 export function ymdInTimeZone(tz: string, d = new Date()): string {
   const id = (tz || '').trim() || 'Asia/Karachi';
-  return new Intl.DateTimeFormat('en-CA', {
+  // Use Intl.DateTimeFormat with explicit parts to avoid locale-specific formatting issues
+  const formatter = new Intl.DateTimeFormat('en-US', {
     timeZone: id,
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
-  }).format(d);
+  });
+  const parts = formatter.formatToParts(d);
+  const y = parts.find((p) => p.type === 'year')?.value;
+  const m = parts.find((p) => p.type === 'month')?.value;
+  const dPart = parts.find((p) => p.type === 'day')?.value;
+  return `${y}-${m}-${dPart}`;
 }
 
 export function resolveTimeZoneId(raw: string | null | undefined): string {
   const t = (raw || '').trim();
-  if (t && t in IANA_TO_UTC_OFFSET) return t;
-  return 'Asia/Karachi';
+  // We accept any string, but we default to Asia/Karachi if it's likely invalid or empty
+  if (!t) return 'Asia/Karachi';
+  return t;
 }
 
 function itemBookingYmd(booking: Booking, item: BookingItem): string {
@@ -132,10 +151,16 @@ export type LiveBookingRef = {
   totalAmount: number;
   /** Booking pricing discount (PKR). */
   discount: number;
+  /** Actual amount paid so far. */
+  paidAmount: number;
   /** Remaining payable amount = totalAmount - paidAmount. */
   remainingAmount: number;
   sportType: string;
   userDisplayName?: string;
+  /** Projected overtime minutes past the scheduled end. */
+  overtimeMinutes?: number;
+  /** Projected additional charge for the overtime (PKR). */
+  overtimeCharge?: number;
 };
 
 function userDisplayName(u: Booking['user'] | undefined | null): string | undefined {
@@ -173,6 +198,80 @@ function collectItemWindows(
     }
   }
   return out.sort((a, b) => a.startMs - b.startMs);
+}
+
+export type CourtSessionSegmentMs = {
+  itemId: string;
+  startMs: number;
+  endMs: number;
+  price: number;
+};
+
+export function computeOvertimeFromCourtSession(
+  nowMs: number,
+  segments: CourtSessionSegmentMs[],
+): { minutes: number; charge: number; lastItemId: string | null } {
+  if (!segments.length) {
+    return { minutes: 0, charge: 0, lastItemId: null };
+  }
+
+  let sessionEndMs = 0;
+  let totalScheduledMs = 0;
+  let totalScheduledPrice = 0;
+  let lastItemId: string | null = null;
+  let maxEnd = -1;
+
+  for (const seg of segments) {
+    sessionEndMs = Math.max(sessionEndMs, seg.endMs);
+    totalScheduledMs += seg.endMs - seg.startMs;
+    totalScheduledPrice += seg.price;
+    if (seg.endMs > maxEnd) {
+      maxEnd = seg.endMs;
+      lastItemId = seg.itemId;
+    }
+  }
+
+  if (nowMs <= sessionEndMs) {
+    return { minutes: 0, charge: 0, lastItemId: null };
+  }
+
+  const durationMinutes = Math.max(1, Math.round(totalScheduledMs / 60000));
+  const perMinuteRate = totalScheduledPrice / durationMinutes;
+  const minutes = Math.max(0, Math.ceil((nowMs - sessionEndMs) / 60000));
+  if (minutes <= 0) {
+    return { minutes: 0, charge: 0, lastItemId: null };
+  }
+
+  const charge = Number((perMinuteRate * minutes).toFixed(2));
+  return { minutes, charge, lastItemId };
+}
+
+function computeSessionOvertime(
+  b: Booking,
+  courtKind: CourtKind,
+  courtId: string,
+  nowMs: number,
+  timeZone: string,
+): { minutes: number; charge: number } {
+  const tz = resolveTimeZoneId(timeZone);
+  const segments: CourtSessionSegmentMs[] = [];
+
+  for (const it of b.items || []) {
+    if (it.courtId !== courtId || it.courtKind !== courtKind) continue;
+    if (it.itemStatus === 'cancelled') continue;
+    const ymd = itemBookingYmd(b, it);
+    if (!ymd) continue;
+    const { startMs, endMs } = wallRangeToMs(ymd, it.startTime, it.endTime, tz);
+    segments.push({
+      itemId: it.id,
+      startMs,
+      endMs,
+      price: numFromDecLike(it.price),
+    });
+  }
+
+  const { minutes, charge } = computeOvertimeFromCourtSession(nowMs, segments);
+  return { minutes, charge };
 }
 
 function hoursBetween(a: number, b: number): number {
@@ -215,12 +314,18 @@ function sessionWindowOnCourt(
 function liveRefFromSessionWindow(
   b: Booking,
   w: { startTime: string; endTime: string },
+  overtime?: { minutes: number; charge: number },
 ): LiveBookingRef {
   const st = String(b.sportType || 'futsal').toLowerCase();
-  const totalAmount = numFromDecLike(b.totalAmount);
+  const baseTotal = numFromDecLike(b.totalAmount);
+  const extra = overtime?.charge ?? 0;
+  const totalAmount = Number((baseTotal + extra).toFixed(2));
   const discount = numFromDecLike(b.discount);
   const paidAmount = numFromDecLike(b.paidAmount);
-  const remainingAmount = Math.max(0, Number((totalAmount - paidAmount).toFixed(2)));
+  const remainingAmount = Math.max(
+    0,
+    Number((totalAmount - paidAmount).toFixed(2)),
+  );
   return {
     bookingId: b.id,
     bookingDate: b.bookingDate,
@@ -228,11 +333,15 @@ function liveRefFromSessionWindow(
     endTime: w.endTime,
     totalAmount,
     discount,
+    paidAmount,
     remainingAmount,
     sportType: (BOOKING_SPORT_TYPES as readonly string[]).includes(st)
       ? st
       : 'futsal',
     userDisplayName: userDisplayName(b.user),
+    ...(overtime && overtime.minutes > 0
+      ? { overtimeMinutes: overtime.minutes, overtimeCharge: overtime.charge }
+      : {}),
   };
 }
 
@@ -308,10 +417,14 @@ export function buildPlaySnapshot(
     }
   }
 
-  // Only expose a booking as `currentBooking` when it is explicitly marked `live`.
-  // Time-window math alone is not sufficient (bookings may still be `confirmed` until the venue flips them to `live`).
+  // Only expose a booking as `ongoing` when it is explicitly marked `live`.
   const ongoing =
-    windows.find((w) => w.startMs <= now && now < w.endMs && w.booking.bookingStatus === 'live') ?? null;
+    windows.find(
+      (w) =>
+        w.startMs <= now &&
+        now < w.endMs &&
+        w.booking.bookingStatus === 'live',
+    ) ?? null;
 
   type SessionWindow = NonNullable<ReturnType<typeof sessionWindowOnCourt>>;
 
@@ -340,7 +453,12 @@ export function buildPlaySnapshot(
   // If a booking time-window has already started but it's still not marked `live`,
   // keep it visible in `nextBooking` until the venue flips it.
   const startedButNotLive = windows
-    .filter((w) => w.startMs <= now && now < w.endMs && w.booking.bookingStatus !== 'live')
+    .filter(
+      (w) =>
+        w.startMs <= now &&
+        now < w.endMs &&
+        w.booking.bookingStatus !== 'live',
+    )
     .sort((a, b) => a.startMs - b.startMs);
 
   const future = windows
@@ -354,10 +472,12 @@ export function buildPlaySnapshot(
     : startedButNotLive[0] ?? future[0] ?? null;
 
   let playStatus: FacilityPlayStatus = 'idle';
-  if (ongoing) {
-    playStatus = 'live';
-  } else if (overtime) {
+  if (overtime) {
     playStatus = 'overtime';
+  } else if (ongoing) {
+    playStatus = 'live';
+  } else if (startedButNotLive.length > 0) {
+    playStatus = 'soon';
   } else if (next) {
     const ms = next.startMs - now;
     if (ms >= 0 && ms <= SOON_MS) {
@@ -381,12 +501,27 @@ export function buildPlaySnapshot(
     playStatus,
     currentBooking:
       ongoing && ongoingSw
-        ? liveRefFromSessionWindow(ongoing.booking, ongoingSw)
+        ? liveRefFromSessionWindow(
+            ongoing.booking,
+            ongoingSw,
+            computeSessionOvertime(ongoing.booking, courtKind, courtId, now, tz),
+          )
         : overtime && overtimeSw
-          ? liveRefFromSessionWindow(overtime.booking, overtimeSw)
+          ? liveRefFromSessionWindow(
+              overtime.booking,
+              overtimeSw,
+              computeSessionOvertime(overtime.booking, courtKind, courtId, now, tz),
+            )
           : null,
     currentEndsAt: currentSw ? new Date(currentSw.endMs).toISOString() : null,
-    nextBooking: next && nextSw ? liveRefFromSessionWindow(next.booking, nextSw) : null,
+    nextBooking:
+      next && nextSw
+        ? liveRefFromSessionWindow(
+            next.booking,
+            nextSw,
+            computeSessionOvertime(next.booking, courtKind, courtId, now, tz),
+          )
+        : null,
     nextStartsAt: next ? new Date(next.startMs).toISOString() : null,
     minutesUntilNext:
       next && next.startMs > now

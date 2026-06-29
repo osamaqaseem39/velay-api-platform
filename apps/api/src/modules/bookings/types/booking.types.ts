@@ -22,7 +22,7 @@ export const BOOKING_STATUSES = [
   'no_show',
 ] as const;
 export type BookingStatus = (typeof BOOKING_STATUSES)[number];
-export type BookingViewStatus = BookingStatus;
+export type BookingViewStatus = BookingStatus | 'overtime';
 
 export const PAYMENT_STATUSES = [
   'pending',
