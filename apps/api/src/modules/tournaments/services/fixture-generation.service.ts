@@ -475,17 +475,16 @@ export class FixtureGenerationService {
     manager: DataSource['manager'],
     division: TournamentDivision,
     stage: TournamentStage,
-    blueprint: StructureBlueprint,
+    _blueprint: StructureBlueprint,
     teamIds: string[],
   ): Promise<number> {
-    const bracketSize = blueprint.knockout?.bracketSize ?? teamIds.length;
-    const drafts = generateKnockoutBracket(teamIds, bracketSize);
+    const drafts = generateKnockoutBracket(teamIds);
     const saved = new Map<string, BracketNode>();
     let count = 0;
 
     for (const d of drafts) {
       let matchId: string | null = null;
-      if (d.round === 1 && !d.isBye && d.teamId && d.awayTeamId) {
+      if (d.round === 1 && d.teamId && d.awayTeamId) {
         const match = await manager.save(TournamentMatch, {
           divisionId: division.id,
           stageId: stage.id,
@@ -551,7 +550,10 @@ export class FixtureGenerationService {
     blueprint: StructureBlueprint,
     rules: StandingsRules,
   ): Promise<string[]> {
-    const grps = await this.groups.find({ where: { stageId: groupStageId } });
+    const grps = await this.groups.find({
+      where: { stageId: groupStageId },
+      order: { name: 'ASC' },
+    });
     const inputs: GroupStandingInput[] = [];
 
     for (const g of grps) {

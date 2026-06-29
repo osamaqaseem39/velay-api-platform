@@ -57,8 +57,15 @@ export function allocateByes(teamCount: number): {
   bracketSize: number;
   byeCount: number;
 } {
-  const bracketSize = nextPowerOfTwo(teamCount);
-  return { bracketSize, byeCount: bracketSize - teamCount };
+  return { bracketSize: teamCount, byeCount: teamCount % 2 === 1 ? 1 : 0 };
+}
+
+function knockoutPreview(teamCount: number) {
+  return {
+    bracketSize: teamCount,
+    byes: teamCount > 0 && teamCount % 2 === 1 ? 1 : 0,
+    rounds: teamCount < 2 ? 0 : Math.ceil(Math.log2(teamCount)),
+  };
 }
 
 function resolveAdvancerCount(
@@ -92,15 +99,10 @@ export function previewStructure(input: {
   } = input;
 
   if (structureType === 'direct_knockout') {
-    const { bracketSize, byeCount } = allocateByes(teamCount);
     return {
       teamCount,
       structureType,
-      knockout: {
-        bracketSize,
-        byes: byeCount,
-        rounds: Math.log2(bracketSize),
-      },
+      knockout: knockoutPreview(teamCount),
     };
   }
 
@@ -141,12 +143,7 @@ export function previewStructure(input: {
       structureType === 'qualifier_group_knockout'
     ) {
       const advCount = resolveAdvancerCount(sizes, advancement);
-      const { bracketSize, byeCount } = allocateByes(advCount);
-      blueprint.knockout = {
-        bracketSize,
-        byes: byeCount,
-        rounds: Math.log2(bracketSize),
-      };
+      blueprint.knockout = knockoutPreview(advCount);
     }
     return blueprint;
   }

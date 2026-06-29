@@ -7,9 +7,11 @@ import { TournamentMatch } from '../entities/tournament-match.entity';
 import { TournamentStage } from '../entities/tournament-stage.entity';
 import { TournamentDivision } from '../entities/tournament-division.entity';
 import {
+  buildNextRoundPairings,
+  collectRoundWinners,
   findNextKnockoutRoundToGenerate,
+  isKnockoutBracketFullyResolved,
   isKnockoutRoundComplete,
-  resolveKnockoutFeederTeam,
 } from '../engines/knockout-round.engine';
 import { TOURNAMENT_ERROR_CODES } from '../types/tournament.types';
 
@@ -54,7 +56,10 @@ export class KnockoutBracketService {
       const roundNodes = nodes.filter((n) => n.round === round);
       const matchesGenerated = roundNodes.filter((n) => n.matchId).length;
       const matchesResolved = roundNodes.filter((n) => {
-        if (!n.matchId) return n.isBye && Boolean(n.teamId);
+        if (!n.matchId) {
+          return (n.isBye && Boolean(n.teamId?.trim())) ||
+            (Boolean(n.teamId?.trim()) && !n.awayTeamId);
+        }
         const m = matchById.get(n.matchId);
         return m != null && ['approved', 'walkover'].includes(m.status);
       }).length;
@@ -113,61 +118,87 @@ export class KnockoutBracketService {
       });
     }
 
-    const nodeMap = new Map(
-      nodes.map((n) => [`${n.round}-${n.slotIndex}`, n] as const),
+    const prevRound = nextRound - 1;
+    const prevRoundNodes = nodes.filter((n) => n.round === prevRound);
+    const byeTeamIds = new Set(
+      prevRoundNodes
+        .filter((n) => n.isBye && n.teamId?.trim())
+        .map((n) => n.teamId!.trim()),
     );
+    const winners = collectRoundWinners(prevRound, nodes, matchById);
+    const { matches, carryTeamId } = buildNextRoundPairings(winners, byeTeamIds);
     let matchesCreated = 0;
+    let slotIndex = 0;
 
-    for (const node of nodes.filter((n) => n.round === nextRound && !n.matchId)) {
-      const homeFeeder = nodeMap.get(`${nextRound - 1}-${node.slotIndex * 2}`);
-      const awayFeeder = nodeMap.get(
-        `${nextRound - 1}-${node.slotIndex * 2 + 1}`,
-      );
-      const homeTeamId = homeFeeder
-        ? resolveKnockoutFeederTeam(homeFeeder, matchById)
-        : null;
-      const awayTeamId = awayFeeder
-        ? resolveKnockoutFeederTeam(awayFeeder, matchById)
-        : null;
-      if (!homeTeamId || !awayTeamId) {
-        throw new ConflictException({
-          code: TOURNAMENT_ERROR_CODES.STAGE_NOT_READY,
-          message: `Round ${nextRound - 1} must be fully resolved before generating round ${nextRound}`,
-        });
-      }
-
+    for (const pair of matches) {
       const match = manager
         ? await manager.save(TournamentMatch, {
             divisionId,
             stageId,
             status: 'draft',
-            homeTeamId,
-            awayTeamId,
+            homeTeamId: pair.homeTeamId,
+            awayTeamId: pair.awayTeamId,
           })
         : await this.matches.save({
             divisionId,
             stageId,
             status: 'draft',
-            homeTeamId,
-            awayTeamId,
+            homeTeamId: pair.homeTeamId,
+            awayTeamId: pair.awayTeamId,
           });
-      node.matchId = match.id;
+      const node = manager
+        ? await manager.save(BracketNode, {
+            stageId,
+            round: nextRound,
+            slotIndex,
+            isBye: false,
+            matchId: match.id,
+          })
+        : await this.bracketNodes.save({
+            stageId,
+            round: nextRound,
+            slotIndex,
+            isBye: false,
+            matchId: match.id,
+          });
       if (manager) {
-        await manager.save(BracketNode, node);
         await manager.save(TournamentFixture, {
           stageId,
           round: nextRound,
           matchId: match.id,
         });
       } else {
-        await this.bracketNodes.save(node);
         await this.fixtures.save({
           stageId,
           round: nextRound,
           matchId: match.id,
         });
       }
-      matchesCreated++;
+      void node;
+      slotIndex += 1;
+      matchesCreated += 1;
+    }
+
+    if (carryTeamId) {
+      if (manager) {
+        await manager.save(BracketNode, {
+          stageId,
+          round: nextRound,
+          slotIndex,
+          teamId: carryTeamId,
+          isBye: true,
+          matchId: null,
+        });
+      } else {
+        await this.bracketNodes.save({
+          stageId,
+          round: nextRound,
+          slotIndex,
+          teamId: carryTeamId,
+          isBye: true,
+          matchId: null,
+        });
+      }
     }
 
     return { round: nextRound, matchesCreated };
@@ -196,6 +227,20 @@ export class KnockoutBracketService {
       where: { divisionId, stageId, deletedAt: IsNull() },
     });
     if (playable === 0) return;
+
+    const nodes = await this.bracketNodes.find({
+      where: { stageId },
+      order: { round: 'ASC', slotIndex: 'ASC' },
+    });
+    const matchIds = nodes
+      .map((n) => n.matchId)
+      .filter((id): id is string => Boolean(id));
+    const linkedMatches =
+      matchIds.length > 0
+        ? await this.matches.find({ where: { id: In(matchIds) } })
+        : [];
+    const matchById = new Map(linkedMatches.map((m) => [m.id, m]));
+    if (!isKnockoutBracketFullyResolved(nodes, matchById)) return;
 
     stage.status = 'completed';
     await this.stages.save(stage);

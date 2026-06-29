@@ -1,5 +1,3 @@
-import { allocateByes } from './structure.engine';
-
 export type BracketNodeDraft = {
   round: number;
   slotIndex: number;
@@ -16,48 +14,60 @@ export function log2(n: number): number {
   return Math.log2(n);
 }
 
+export function knockoutRoundCount(teamCount: number): number {
+  if (teamCount < 2) return 0;
+  return Math.ceil(Math.log2(teamCount));
+}
+
+export function knockoutByeCount(teamCount: number): number {
+  return teamCount > 0 && teamCount % 2 === 1 ? 1 : 0;
+}
+
+export function pairConsecutiveTeams(
+  teamIds: string[],
+): { homeTeamId: string; awayTeamId: string }[] {
+  const pairs: { homeTeamId: string; awayTeamId: string }[] = [];
+  for (let i = 0; i + 1 < teamIds.length; i += 2) {
+    pairs.push({ homeTeamId: teamIds[i], awayTeamId: teamIds[i + 1] });
+  }
+  return pairs;
+}
+
 export function generateKnockoutBracket(
   teamIds: string[],
-  bracketSize?: number,
+  _bracketSize?: number,
 ): BracketNodeDraft[] {
-  const size = bracketSize ?? allocateByes(teamIds.length).bracketSize;
-  const rounds = Math.log2(size);
+  const n = teamIds.length;
+  if (n < 2) return [];
+
   const nodes: BracketNodeDraft[] = [];
 
-  for (let round = 1; round <= rounds; round++) {
-    const matchCount = size / Math.pow(2, round);
-    for (let slot = 0; slot < matchCount; slot++) {
-      const draft: BracketNodeDraft = { round, slotIndex: slot, isBye: false };
-      if (round < rounds) {
-        draft.parentRound = round + 1;
-        draft.parentSlotIndex = Math.floor(slot / 2);
-      }
-      nodes.push(draft);
+  if (n % 2 === 1) {
+    const pairs = pairConsecutiveTeams(teamIds.slice(1));
+    for (let i = 0; i < pairs.length; i++) {
+      nodes.push({
+        round: 1,
+        slotIndex: i,
+        teamId: pairs[i].homeTeamId,
+        awayTeamId: pairs[i].awayTeamId,
+        isBye: false,
+      });
     }
+    nodes.push({
+      round: 1,
+      slotIndex: pairs.length,
+      teamId: teamIds[0],
+      isBye: true,
+    });
+    return nodes;
   }
 
-  const round1Slots = size / 2;
-  const seeded = [...teamIds];
-  while (seeded.length < size) seeded.push('__BYE__');
-
-  for (let i = 0; i < round1Slots; i++) {
-    const home = seeded[i];
-    const away = seeded[size - 1 - i];
-    const node = nodes.find((n) => n.round === 1 && n.slotIndex === i);
-    if (!node) continue;
-    if (home === '__BYE__' && away === '__BYE__') {
-      node.isBye = true;
-    } else if (home === '__BYE__') {
-      node.isBye = true;
-      node.teamId = away;
-    } else if (away === '__BYE__') {
-      node.isBye = true;
-      node.teamId = home;
-    } else {
-      node.teamId = home;
-      node.awayTeamId = away;
-    }
-  }
-
-  return nodes;
+  const pairs = pairConsecutiveTeams(teamIds);
+  return pairs.map((pair, slotIndex) => ({
+    round: 1,
+    slotIndex,
+    teamId: pair.homeTeamId,
+    awayTeamId: pair.awayTeamId,
+    isBye: false,
+  }));
 }

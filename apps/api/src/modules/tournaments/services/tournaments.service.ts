@@ -42,6 +42,7 @@ import {
 import { TournamentAuditService } from './tournament-audit.service';
 import { FixtureGenerationService } from './fixture-generation.service';
 import { KnockoutBracketService } from './knockout-bracket.service';
+import { isKnockoutBracketFullyResolved } from '../engines/knockout-round.engine';
 
 export type TournamentDivisionRow = {
   id: string;
@@ -607,6 +608,41 @@ export class TournamentsService {
         message:
           'All matches must be approved, walkovers, or cancelled before finishing',
       });
+    }
+
+    await this.assertKnockoutBracketsResolved(divisionId);
+  }
+
+  private async assertKnockoutBracketsResolved(divisionId: string): Promise<void> {
+    const knockoutStages = await this.stages.find({
+      where: {
+        divisionId,
+        stageType: 'knockout',
+        deletedAt: IsNull(),
+        status: Not(In(['cancelled', 'pending', 'generating'])),
+      },
+    });
+    for (const stage of knockoutStages) {
+      const nodes = await this.bracketNodes.find({
+        where: { stageId: stage.id },
+        order: { round: 'ASC', slotIndex: 'ASC' },
+      });
+      if (nodes.length === 0) continue;
+      const matchIds = nodes
+        .map((n) => n.matchId)
+        .filter((id): id is string => Boolean(id));
+      const linkedMatches =
+        matchIds.length > 0
+          ? await this.matches.find({ where: { id: In(matchIds) } })
+          : [];
+      const matchById = new Map(linkedMatches.map((m) => [m.id, m]));
+      if (!isKnockoutBracketFullyResolved(nodes, matchById)) {
+        throw new ConflictException({
+          code: TOURNAMENT_ERROR_CODES.STAGE_NOT_READY,
+          message:
+            'Knockout is not finished — generate remaining rounds and approve every match before completing',
+        });
+      }
     }
   }
 

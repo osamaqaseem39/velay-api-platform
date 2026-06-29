@@ -19,16 +19,33 @@ export function pickAdvancingTeams(
 ): string[] {
   const topN = Math.max(1, Number(advancement?.topNPerGroup ?? 2));
   const bestThird = Math.max(0, Number(advancement?.bestThirdPlace ?? 0));
-  const advanced: string[] = [];
+  const sortedGroups = [...groups].sort((a, b) =>
+    a.groupName.localeCompare(b.groupName),
+  );
+  const perGroup: string[][] = [];
   const thirdPlace: StandingRow[] = [];
 
-  for (const g of groups) {
+  for (const g of sortedGroups) {
     const rows = computeStandings(g.teamIds, g.results, g.rules);
+    const picked: string[] = [];
     for (let i = 0; i < topN && i < rows.length; i++) {
-      advanced.push(rows[i].teamId);
+      picked.push(rows[i].teamId);
     }
+    perGroup.push(picked);
     if (bestThird > 0 && rows.length > topN) {
       thirdPlace.push(rows[topN]);
+    }
+  }
+
+  const advanced: string[] = [];
+  const maxRank = perGroup.reduce((max, groupTeams) => {
+    return Math.max(max, groupTeams.length);
+  }, 0);
+  for (let rank = 0; rank < maxRank; rank++) {
+    for (const groupTeams of perGroup) {
+      if (rank < groupTeams.length) {
+        advanced.push(groupTeams[rank]);
+      }
     }
   }
 
